@@ -58,32 +58,40 @@ export async function extractSellerProducts(page: Page): Promise<SellerProductPr
         .catch(() => {});
     if ((await gallery.count()) === 0) return [];
 
+    // Every field of every card in one round trip. Reading them through locators cost two CDP calls
+    // per field (count, then read) — ~180 for ten cards, ~10 s through the proxy — for strings the
+    // browser has at hand. Only the raw strings come back; parsing stays below, unchanged.
+    // No named helper functions in here: `tsx` (esbuild) wraps them in `__name(...)`, which does not
+    // exist in the page, so the dev server would throw where the tsc build works.
+    const cards = await page.$$eval('#proGallery .gitem', (items) =>
+        items.map((item) => ({
+            itemcode: item.querySelector('a.pic')?.getAttribute('itemcode') ?? null,
+            href: item.querySelector('a.pic')?.getAttribute('href') ?? null,
+            imageSrc: item.querySelector('img.gthumbnail')?.getAttribute('src') ?? null,
+            titleAttr: item.querySelector('a.pro-title')?.getAttribute('title') ?? null,
+            titleText: (item.querySelector('a.pro-title')?.textContent ?? '').replace(/\s+/g, ' ').trim(),
+            priceText: (item.querySelector('li.price span')?.textContent ?? '').replace(/\s+/g, ' ').trim(),
+            originalPriceText: (item.querySelector('li.costprice span')?.textContent ?? '').replace(/\s+/g, ' ').trim(),
+            // The preview strip often renders an EMPTY .pro-rating (no `.rating > span`).
+            ratingStyle: item.querySelector('.pro-rating .rating > span')?.getAttribute('style') ?? null,
+            reviewText: (item.querySelector('.pro-rating .num')?.textContent ?? '').replace(/\s+/g, ' ').trim(),
+        })),
+    );
+
     const previews: SellerProductPreview[] = [];
-    for (const item of await gallery.all()) {
-        // Keep at most MAX_PREVIEWS; stop reading further cards' DOM once we hit it.
+    for (const card of cards) {
+        // Keep at most MAX_PREVIEWS.
         if (previews.length >= MAX_PREVIEWS) break;
 
-        const pic = item.locator('a.pic').first();
+        const productId = (card.itemcode ?? '').trim() || null;
+        const url = stripUrlParams(card.href);
+        const imageUrl = normalizeImageUrl(card.imageSrc);
+        const title = (card.titleAttr ?? card.titleText ?? '').replace(/\s+/g, ' ').trim() || null;
 
-        const productId = ((await readAttr(pic, 'itemcode')) ?? '').trim() || null;
-        const url = stripUrlParams(await readAttr(pic, 'href'));
-        const imageUrl = normalizeImageUrl(await readAttr(item.locator('img.gthumbnail').first(), 'src'));
-
-        const titleLoc = item.locator('a.pro-title').first();
-        const title =
-            ((await readAttr(titleLoc, 'title')) ?? (await readText(titleLoc)) ?? '').replace(/\s+/g, ' ').trim() ||
-            null;
-
-        const priceText = (await readText(item.locator('li.price span').first())) || null;
-        const originalPriceText = (await readText(item.locator('li.costprice span').first())) || null;
+        const priceText = card.priceText || null;
+        const originalPriceText = card.originalPriceText || null;
         const price = parseAmount(priceText);
         const originalPrice = parseAmount(originalPriceText);
-
-        // The preview strip often renders an EMPTY .pro-rating (no `.rating > span`).
-        // getAttribute on a zero-match locator waits out the full action timeout and
-        // throws, so guard with readAttr (count-checked) instead of calling it directly.
-        const ratingStyle = await readAttr(item.locator('.pro-rating .rating > span').first(), 'style');
-        const reviewText = await readText(item.locator('.pro-rating .num').first());
 
         // Skip rows that carry no product reference (defensive: spacer/ad cards).
         if (!productId && !url) continue;
@@ -100,8 +108,8 @@ export async function extractSellerProducts(page: Page): Promise<SellerProductPr
                 originalPrice,
                 originalPriceText,
                 discountPercent: discountPercent(price, originalPrice),
-                rating: ratingFromWidth(ratingStyle),
-                reviewCount: parseCompactNumber(reviewText),
+                rating: ratingFromWidth(card.ratingStyle),
+                reviewCount: parseCompactNumber(card.reviewText),
             }),
         );
     }
@@ -116,20 +124,4 @@ function compact(obj: Record<string, unknown>): SellerProductPreview {
         if (value !== null && value !== undefined) out[key] = value;
     }
     return out as SellerProductPreview;
-}
-
-/** Read trimmed text content from a locator, returning '' when the element is absent. */
-async function readText(loc: ReturnType<Page['locator']>): Promise<string> {
-    if ((await loc.count()) === 0) return '';
-    return ((await loc.textContent()) ?? '').replace(/\s+/g, ' ').trim();
-}
-
-/**
- * Read an attribute from a locator, returning null when the element is absent.
- * Unlike a bare `getAttribute`, this never waits out the action timeout on a
- * zero-match locator — it checks `count()` first.
- */
-async function readAttr(loc: ReturnType<Page['locator']>, name: string): Promise<string | null> {
-    if ((await loc.count()) === 0) return null;
-    return await loc.getAttribute(name);
 }

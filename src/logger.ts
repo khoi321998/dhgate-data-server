@@ -7,6 +7,11 @@ export { log };
 /** Prefix of the job running in the current async context: "url" or "url [transactionId: x]". */
 const jobPrefix = new AsyncLocalStorage<string>();
 
+/** The prefix of the job running here, to hand to callbacks that run outside this async context. */
+export function currentJobPrefix(): string | undefined {
+    return jobPrefix.getStore();
+}
+
 export async function runWithJobPrefix<T>(prefix: string, fn: () => Promise<T>): Promise<T> {
     return jobPrefix.run(prefix, fn);
 }

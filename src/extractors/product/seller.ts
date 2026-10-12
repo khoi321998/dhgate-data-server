@@ -1,6 +1,8 @@
 import type { Page } from 'playwright';
+
 import type { SellerRef } from '../../dto/index.js';
-import { extractSellerId, stripUrlParams, normalizeImageUrl, parseAmount } from '../../utils/parse.js';
+import { extractSellerId, normalizeImageUrl, parseAmount,stripUrlParams } from '../../utils/parse.js';
+import { scrollUntilAttached } from '../../utils/scroll.js';
 
 /** Seller data read inline from the PDP's "About the Store" block (no navigation). */
 export interface SellerInline {
@@ -21,20 +23,17 @@ export interface SellerInline {
  * - `span[title]`           -> badge tooltips (Trade Assurance, Top Superior, tier, "1st year"…)
  */
 export async function extractSellerInline(page: Page): Promise<SellerInline | null> {
-    // "About the Store" sits low on the PDP and mounts lazily — scroll to the bottom
-    // so React renders it, then wait for it to attach before reading.
-    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+    // "About the Store" sits low on the PDP and mounts lazily — scroll down to it, a step at a
+    // time (see `scrollUntilAttached`), so React renders it, before reading.
     // The PDP renders several [spm-c="soldby"] containers (tracking/exposure
     // wrappers alongside the real "About the Store" card), and the card is not
     // always first in document order. Anchor on the soldby block that actually
     // contains the store link rather than blindly taking .first() — otherwise we
     // pick an empty wrapper and report "no seller store URL" while the link is
-    // sitting in a sibling block. The has-filter also makes waitFor block until
+    // sitting in a sibling block. The has-filter also keeps the scroll going until
     // the lazily-mounted store link is present.
     const block = page.locator('[spm-c="soldby"]', { has: page.locator('a[spm-index="store"]') }).first();
-    await block.waitFor({ state: 'attached', timeout: 10_000 }).catch(() => {});
-    if ((await block.count()) === 0) return null;
-    await block.scrollIntoViewIfNeeded().catch(() => {});
+    if (!(await scrollUntilAttached(page, block, 10_000))) return null;
 
     const storeLink = block.locator('a[spm-index="store"]').first();
     if ((await storeLink.count()) === 0) return null;

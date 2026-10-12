@@ -2,9 +2,9 @@
 
 A self-hosted HTTP server that scrapes one DHGate product or seller URL per request and returns the row in the response: product (title, pricing, stock, delivery, payment methods, description, specifications, media, reviews) and/or seller (store header, product previews, about, feedback).
 
-Pages are loaded in a headed real Google Chrome driven by [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) through Crawlee's `PlaywrightCrawler`, which waits out (or clicks through) DHGate's Cloudflare challenge. Each retry runs on a new session and so a new Apify residential US proxy IP. Apify is used only for that proxy; this is not an Apify Actor.
+Pages are loaded in a headed real Google Chrome driven by [Patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) through Crawlee's `PlaywrightCrawler`, which waits out (or clicks through) DHGate's Cloudflare challenge. Each retry runs on a new session and so, through Apify Proxy (`APIFY_PROXY_GROUPS`: datacenter or residential), a new IP. Apify is used only for that proxy; this is not an Apify Actor.
 
-One crawler (and its browser) stays up for the life of the process. `MAX_CONCURRENCY` pages run in parallel, the rest wait in the crawler's queue, and once `MAX_QUEUE` requests are running or waiting the server returns `503`.
+Every request runs in a Chrome launched for it, on a new proxy session (so a new IP) with no cookies from earlier requests, and the browser is closed when the request is done. A failed attempt (blocked, Cloudflare it cannot pass, an error) is retried up to `MAX_REQUEST_RETRIES` times, each time in a new browser on a new session. `MAX_CONCURRENCY` requests run in parallel, the rest wait in the crawler's queue, and once `MAX_QUEUE` requests are running or waiting the server returns `503`.
 
 ## API
 
@@ -48,6 +48,7 @@ Response `200`:
 
 - The body is the same row the Apify Actor pushed to its dataset (see [src/dto/response.ts](src/dto/response.ts)), plus `status` and `timing`.
 - A `200` can still have `success: false`: `errorCode` is `ITEM_NOT_FOUND` / `SELLER_NOT_FOUND` when the listing or store is gone, or `FETCH_FAILED` when the product was scraped but the seller page never loaded (the product is kept).
+- `product_and_seller` reads the store link from the store header at the top of the product page and opens the store page in a second tab of the request's browser while the product is being scraped (and the store's About Us page in a third), so the request takes about as long as the slower of the two pages. If the store page is blocked or fails, the whole request is retried in a new browser; once retries run out the product is kept and the row reports `FETCH_FAILED` for the seller. The two rows are merged with the same precedence as before (identity from the product page, stats / previews / about / reviews from the store page).
 - `extraction.status` other than `ok` usually means a DHGate markup change broke a selector.
 - `timing.queueMs` is the time before the crawler picked the request up. `processMs` is the scrape itself, including retries.
 - Every error response has the same body: `{ "status": "failed", "url", "error", "statusCode", "timing" }`. `url` is `null` when the request had no valid url. `statusCode` is the HTTP status of the last failed navigation, or `null`; `timing` is all zeros when no scrape ran.
@@ -62,7 +63,7 @@ Response `200`:
 
 ### `GET /`
 
-Health check. No auth. Returns `{"status":"ok","maxConcurrency":4,"maxQueue":100,"inProgress":1,"jobs":1}`.
+Health check. No auth. Returns `{"status":"ok","maxConcurrency":4,"maxQueue":100,"inProgress":1,"jobs":1,"browsers":{"active":1,"retired":0}}`.
 
 ## Running with Docker
 
@@ -83,12 +84,14 @@ docker run -d --name dhgate-server -p 8080:8080 --init --shm-size=1g --env-file 
 | --- | --- | --- |
 | `API_KEY` | required | Shared secret the caller sends in `x-api-key` (at least 16 characters). Generate with `openssl rand -hex 32` |
 | `PORT` | `8080` | HTTP port |
-| `MAX_CONCURRENCY` | `4` | Browser pages open at once |
+| `MAX_CONCURRENCY` | `4` | Requests scraped at once, each in its own headed Chrome (with up to 3 tabs for `product_and_seller`). Size it to the machine: under load each page gets slower and DHGate's lazy blocks start to miss their waits |
 | `MAX_QUEUE` | `100` | Max requests running or waiting. Beyond this, requests get `503` |
 | `MAX_REQUEST_RETRIES` | `3` | Retries per page after the first attempt, each on a new session / proxy IP |
 | `JOB_TIMEOUT_SECS` | `900` | A request with no result after this long gets `502` |
-| `USE_APIFY_PROXY` | `true` | Go out through Apify residential US proxy. `false` = this machine's own IP (many more Cloudflare challenges) |
-| `APIFY_PROXY_PASSWORD` | | Required when `USE_APIFY_PROXY` is on; the server refuses to start without it |
+| `PARALLEL_SELLER` | `true` | `product_and_seller`: open the store page in a second tab as soon as the product page has loaded, instead of after the product is scraped. `false` = one after the other |
+| `APIFY_PROXY_PASSWORD` | | Required when `APIFY_PROXY_GROUPS` is set; the server refuses to start without it |
+| `APIFY_PROXY_GROUPS` | empty | Apify proxy: empty = none (this machine's own IP, many more Cloudflare challenges), `DATACENTER` or `RESIDENTIAL` (the exit that measured best on DHGate). Anything else stops the server at startup |
+| `APIFY_PROXY_COUNTRY` | `US` | Two-letter exit country. Empty = any country |
 | `DHGATE_CHALLENGE_TIMEOUT_MS` | `60000` | How long to let the Cloudflare challenge run (see [src/utils/cloudflare.ts](src/utils/cloudflare.ts)) |
 
 The server logs its effective configuration at startup. Secrets are shown only as `set` or `not set`.
@@ -107,5 +110,5 @@ Every line of a request starts with its url and `transactionId`, so one request 
 npm install
 npm run build        # tsc -> dist/
 npm test
-API_KEY=<key> USE_APIFY_PROXY=false npm run start:dev    # runs src/server.ts with tsx (needs Google Chrome installed locally)
+API_KEY=<key> npm run start:dev    # runs src/server.ts with tsx (needs Google Chrome installed locally)
 ```

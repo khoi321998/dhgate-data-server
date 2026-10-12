@@ -7,8 +7,8 @@ import { log } from './logger.js';
  * One `POST /scrape` call, from the moment it is accepted until the crawler produces its row.
  *
  * The crawler is long-lived and shared by every request, so the HTTP side and the crawl side meet
- * here: the start request carries `userData.jobId`, the seller request enqueued from it inherits
- * that `userData`, and whichever handler pushes the final row completes the job by that id.
+ * here: the request carries `userData.jobId`, and the handler that pushes its row completes the job
+ * by that id. Every attempt of a request runs in a new browser.
  */
 export interface Job {
     id: string;
@@ -22,7 +22,7 @@ export interface Job {
     startedAt?: number;
     /** HTTP status of the last navigation that failed for good, for the failed response. */
     statusCode?: number | null;
-    /** Queue entries this job created (product page, seller page), dropped once the job is done. */
+    /** Queue entries this job created, dropped once the job is done. */
     requestIds: Set<string>;
     result: Promise<ProductSellerResponse>;
 }
@@ -46,7 +46,12 @@ export function createJob(fields: Pick<Job, 'id' | 'url' | 'transactionId' | 'mo
     const result = new Promise<ProductSellerResponse>((r) => {
         resolve = r;
     });
-    const job: Job = { ...fields, enqueuedAt: Date.now(), requestIds: new Set(), result };
+    const job: Job = {
+        ...fields,
+        enqueuedAt: Date.now(),
+        requestIds: new Set(),
+        result,
+    };
     jobs.set(job.id, job);
     resolvers.set(job.id, resolve);
     return job;

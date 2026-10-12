@@ -1,23 +1,35 @@
 import type { PlaywrightCrawlingContext } from '@crawlee/playwright';
+import type { Page } from 'playwright';
+
+import { MAX_REQUEST_RETRIES, PARALLEL_SELLER } from '../config.js';
 import type { CaptureMode, ProductSellerResponse } from '../dto/index.js';
-import { extractTitle } from '../extractors/product/title.js';
-import { extractPricing } from '../extractors/product/pricing.js';
-import { extractMedia } from '../extractors/product/media.js';
-import { extractDescription } from '../extractors/product/description.js';
-import { extractSpecifications } from '../extractors/product/specifications.js';
-import { extractHeadlineStats } from '../extractors/product/headlineStats.js';
-import { extractAvailableQuantity } from '../extractors/product/stock.js';
-import { extractReviews } from '../extractors/product/reviews.js';
-import { extractDeliveryTimeText } from '../extractors/product/shipping.js';
-import { extractPaymentMethods } from '../extractors/product/paymentMethods.js';
-import { extractSellerInline } from '../extractors/product/seller.js';
 import { detectBlocked, detectNotFound } from '../extractors/notFound.js';
-import { effectiveStatus } from '../utils/cloudflare.js';
+import { extractDescription } from '../extractors/product/description.js';
+import { extractHeadlineStats } from '../extractors/product/headlineStats.js';
+import { extractMedia } from '../extractors/product/media.js';
+import { extractPaymentMethods } from '../extractors/product/paymentMethods.js';
+import { extractPricing } from '../extractors/product/pricing.js';
+import { extractReviews } from '../extractors/product/reviews.js';
+import { extractSellerInline } from '../extractors/product/seller.js';
+import { extractDeliveryTimeText } from '../extractors/product/shipping.js';
+import { extractSpecifications } from '../extractors/product/specifications.js';
+import { extractAvailableQuantity } from '../extractors/product/stock.js';
+import { extractTitle } from '../extractors/product/title.js';
+import { mergeSellerPart } from '../merge.js';
+import { pushItem } from '../push.js';
+import { blockUnneededRequests } from '../utils/blocking.js';
+import { effectiveStatus, settleCloudflareChallenge } from '../utils/cloudflare.js';
 import { emptyProduct, emptyResponse, emptySeller, errorResponse } from '../utils/defaults.js';
 import { extractProductId, normalizeDhgateHost } from '../utils/parse.js';
 import { reportedUrl } from '../utils/request.js';
-import { pushItem } from '../push.js';
-import { LABELS } from '../labels.js';
+import { logPageErrors, releasePage } from '../utils/tabs.js';
+import { scrapeStorePage, sellerRow } from './seller.js';
+
+/** Navigation budget for the store page's tab (Crawlee's own pages get 60 s too). */
+const STORE_NAVIGATION_TIMEOUT_MILLIS = 60_000;
+
+/** The store page's row, or why the tab could not produce one. */
+type StoreTabOutcome = { row: ProductSellerResponse } | { error: Error };
 
 /**
  * Handle a DHGate product detail page.
@@ -27,14 +39,14 @@ import { LABELS } from '../labels.js';
  * `mode` is threaded in so we know whether to also enqueue the seller later.
  */
 export async function handleProduct(ctx: PlaywrightCrawlingContext, mode: CaptureMode): Promise<void> {
-    const { request, page, log, addRequests } = ctx;
+    const { request, page, log } = ctx;
     const url = request.loadedUrl ?? request.url;
     // What the row reports: the caller's original URL, not our normalized rewrite of it.
     const outUrl = reportedUrl(request);
+    // The store page opens in a tab of this browser context, so it ships to the same country as this
+    // page — the `b2b_ship_country` cookie is set on the context (see server.ts) — and one row never
+    // mixes two regional contexts.
     const wantSeller = mode === 'product_and_seller';
-    // Carried from the start URL's subdomain (see server.ts). The seller page must be visited
-    // with the same ship-to country, otherwise one row mixes two regional contexts.
-    const { shipCountry } = request.userData as { shipCountry?: string };
 
     // The status that describes the DOM we are about to read — which is not `ctx.response`'s when
     // a Cloudflare challenge stood in front of it and then handed us the real page. See
@@ -61,6 +73,14 @@ export async function handleProduct(ctx: PlaywrightCrawlingContext, mode: Captur
     // racing them — otherwise the price read can pick up the wrong value.
     const id = extractProductId(url) ?? '';
 
+    // product_and_seller: start the store page now, in another tab of this request's browser, instead
+    // of after every extractor below — it runs while they do and is awaited at the end. Its link is in
+    // the server-rendered store header at the top of the PDP, so reading it needs no scroll and does
+    // not race the extractors.
+    const parallelStoreUrl = wantSeller && PARALLEL_SELLER ? await readStoreUrl(page) : null;
+    if (parallelStoreUrl) log.info(`Opening seller store page in a parallel tab: ${parallelStoreUrl}`);
+    const parallelStore = parallelStoreUrl ? scrapeStoreInTab(ctx, parallelStoreUrl, outUrl, mode) : null;
+
     // Read-only extractors + the reviews API call can run concurrently. extractMedia
     // hovers the gallery (a DOM side effect), so it must run AFTER the price/title
     // reads to avoid racing them — otherwise the price read can pick up the wrong value.
@@ -84,7 +104,11 @@ export async function handleProduct(ctx: PlaywrightCrawlingContext, mode: Captur
             return r;
         }),
         extractHeadlineStats(page).then((r) => {
-            log.info('[product] headlineStats', { rating: r.rating, reviewCount: r.reviewCount, soldCount: r.soldCount });
+            log.info('[product] headlineStats', {
+                rating: r.rating,
+                reviewCount: r.reviewCount,
+                soldCount: r.soldCount,
+            });
             return r;
         }),
         extractAvailableQuantity(page).then((r) => {
@@ -103,18 +127,22 @@ export async function handleProduct(ctx: PlaywrightCrawlingContext, mode: Captur
             return r;
         }),
     ]);
+    // A crashed app leaves nothing for the steps below but their timeouts — check before them.
+    await retryIfAppCrashed(ctx);
     const media = await extractMedia(page);
     log.info('[product] media', { images: media.images.length, videos: media.videos.length });
 
-    // Runs after the price/title reads: opens the "Buyer Protection" modal (a DOM
-    // side effect), so it must not race the concurrent reads above.
+    // An API call from the page, not the "Buyer Protection" modal: no DOM side effect.
     const paymentMethods = await extractPaymentMethods(page);
     log.info(`[product] paymentMethods: ${paymentMethods.join(', ') || '(none)'}`);
 
     // Runs after the price/title reads: scrolls to the bottom to mount the lazy
     // description block (same DOM side effect as extractSellerInline below).
     const description = await extractDescription(page);
-    log.info('[product] description', { plainTextChars: description.plainText.length, htmlChars: description.html.length });
+    log.info('[product] description', {
+        plainTextChars: description.plainText.length,
+        htmlChars: description.html.length,
+    });
 
     // Runs last: it scrolls to the bottom of the page (a DOM side effect), so it must
     // not race the price/title reads above. Only needed when we also want the seller.
@@ -128,6 +156,7 @@ export async function handleProduct(ctx: PlaywrightCrawlingContext, mode: Captur
         });
     }
 
+    await retryIfAppCrashed(ctx);
     const product = emptyProduct();
     product.id = id;
     product.title = title ?? '';
@@ -162,36 +191,131 @@ export async function handleProduct(ctx: PlaywrightCrawlingContext, mode: Captur
 
     log.info(`[product] scraped: ${product.title || '(no title)'} (id=${product.id || '(none)'})`);
 
-    // Hand off to the seller store page so the seller handler can enrich the
-    // profile and push ONE merged row. The full response is carried in userData.
-    // The uniqueKey includes the product id so the same store is still visited
-    // once per product (instead of being deduped across products).
-    if (wantSeller && sellerInline?.ref.url) {
-        log.info(`Enqueuing seller store page: ${sellerInline.ref.name ?? ''}`, {
+    // Done with the product page. When a store page is still to come, unload this one now instead of
+    // keeping DHGate's app (scripts, video, trackers) running until the store is in. It is blanked, not
+    // closed: it is Crawlee's page, and with a browser's only Crawlee page closed the pool closes the
+    // browser — and the store tab with it. Crawlee closes it after the handler.
+    if (parallelStore || (wantSeller && sellerInline?.ref.url)) await releasePage(page);
+
+    // The store page: the parallel tab's result, or — when its link was not in the header — a tab
+    // opened now from the "About the Store" block's link.
+    let store = parallelStore ? await parallelStore : null;
+    if (!store && wantSeller && sellerInline?.ref.url) {
+        log.info(`Opening seller store page: ${sellerInline.ref.name ?? ''}`, {
             sellerId: sellerInline.ref.platformSellerId,
             storeUrl: sellerInline.ref.url,
         });
-        await addRequests([
-            {
-                url: normalizeDhgateHost(sellerInline.ref.url),
-                label: LABELS.SELLER,
-                // Prefixed with this request's own key (unique per `POST /scrape` call): the crawler
-                // is long-lived, so without it a second call for the same product would have its
-                // seller page deduped away and never get a row.
-                uniqueKey: `${request.uniqueKey}|seller:${id}:${sellerInline.ref.platformSellerId ?? sellerInline.ref.url}`,
-                // `inputUrl` rides along so the seller handler still reports the caller's URL
-                // if it ever has to build a row of its own. The rest of `userData` (job id, mode)
-                // is inherited so the seller row completes the same job.
-                userData: { ...request.userData, partialResponse: response, shipCountry, inputUrl: outUrl },
-            },
-        ]);
-        return; // the seller handler pushes the combined row
+        store = await scrapeStoreInTab(ctx, normalizeDhgateHost(sellerInline.ref.url), outUrl, mode);
     }
-
-    if (wantSeller && !sellerInline?.ref.url) {
+    if (wantSeller && !store) {
         log.warning('product_and_seller mode: no seller store URL found on PDP — pushing product only', { url });
     }
 
-    // No seller to visit (product_only, or the seller block was missing): push as-is.
-    await pushItem(ctx, response);
+    let row = response;
+    if (store && 'error' in store) {
+        // The store page was refused or broke: retry the whole request, in a new browser on a new
+        // session, like any other failed page.
+        if (request.retryCount < MAX_REQUEST_RETRIES) {
+            throw new Error(`store page failed: ${store.error.message} — retrying with a new session`);
+        }
+        // Out of retries: keep the good product and report only the seller as unreachable.
+        row = mergeSellerPart(
+            response,
+            errorResponse(
+                outUrl,
+                mode,
+                'FETCH_FAILED',
+                `store page: gave up after ${request.retryCount} retries: ${store.error.message}`,
+            ),
+        );
+    } else if (store) {
+        row = mergeSellerPart(response, store.row);
+    }
+
+    await pushItem(ctx, row);
+}
+
+/**
+ * Open the store page in a new tab of this request's browser and scrape it. The tab shares the
+ * request's cookies (locale, ship-to, Cloudflare clearance) and proxy session. It is not one of
+ * Crawlee's pages, so the Cloudflare wait the navigation hooks give those is done here; a challenge it
+ * cannot wait out fails the store page.
+ *
+ * Never rejects: the outcome is awaited only after the product extractors, and a rejection sitting
+ * unawaited in the meantime would be reported as unhandled.
+ */
+async function scrapeStoreInTab(
+    ctx: PlaywrightCrawlingContext,
+    storeUrl: string,
+    outUrl: string,
+    mode: CaptureMode,
+): Promise<StoreTabOutcome> {
+    const { page, log } = ctx;
+    let tab: Page | undefined;
+    try {
+        tab = await page.context().newPage();
+        logPageErrors(tab, 'seller');
+        await blockUnneededRequests(tab);
+        // `domcontentloaded`, as for every page Crawlee opens here (see server.ts).
+        const navigation = await tab.goto(storeUrl, {
+            waitUntil: 'domcontentloaded',
+            timeout: STORE_NAVIGATION_TIMEOUT_MILLIS,
+        });
+        const challenge = await settleCloudflareChallenge(tab);
+        if (challenge.outcome === 'stuck')
+            throw new Error('Cloudflare is still holding the store page on its challenge');
+        // Past a challenge, the recorded status belongs to the interstitial — see `effectiveStatus`.
+        const status = challenge.outcome === 'passed' ? undefined : navigation?.status();
+
+        // The tab is ours, so it is closed as soon as its own reads are done, without waiting for the
+        // About Us tab it opened.
+        const storeTab = tab;
+        const result = await scrapeStorePage(tab, log, tab.url(), status, async () => storeTab.close());
+        if (result.kind === 'blocked') throw new Error(`${result.reason} for ${storeUrl}`);
+        if (result.kind === 'notFound') return { row: errorResponse(outUrl, mode, 'SELLER_NOT_FOUND', result.reason) };
+        return { row: sellerRow(outUrl, mode, result.seller) };
+    } catch (error) {
+        return { error: error as Error };
+    } finally {
+        await tab?.close().catch(() => undefined);
+    }
+}
+
+/**
+ * DHGate's product page is a Next.js app. When a script it needs fails to load — seen through the
+ * proxy as `ERR_TUNNEL_CONNECTION_FAILED` / `429` on its resources under load — React throws while
+ * rendering and Next replaces the whole page with "Application error: a client-side exception has
+ * occurred". Nothing on that page is the product, so the attempt is retried in a new browser on a new
+ * session. Once retries run out, the fields read before the crash are kept rather than thrown away.
+ */
+const APP_CRASHED = `DHGate's page crashed in the browser (Next.js "Application error")`;
+
+async function retryIfAppCrashed({ page, request, log }: PlaywrightCrawlingContext): Promise<void> {
+    const crashed = await page
+        .evaluate(() => /Application error: a client-side exception/i.test(document.body?.innerText ?? ''))
+        .catch(() => false);
+    if (!crashed) return;
+    if (request.retryCount < MAX_REQUEST_RETRIES) {
+        throw new Error(`${APP_CRASHED} — retrying with a new session`);
+    }
+    log.warning(`[product] ${APP_CRASHED} and retries are spent — keeping what was read before`);
+}
+
+/**
+ * The store URL from the PDP's store header (`[spm-c="logostore"]`, server-rendered at the top of the
+ * page), absolute, on the `www` host and without query / hash. `null` when the page has none.
+ */
+async function readStoreUrl(page: PlaywrightCrawlingContext['page']): Promise<string | null> {
+    const href = await page
+        .locator('a[spm-index="store"][href*="/store/"]')
+        .first()
+        .getAttribute('href', { timeout: 5_000 })
+        .catch(() => null);
+    if (!href) return null;
+    try {
+        const absolute = new URL(href, page.url());
+        return normalizeDhgateHost(`${absolute.origin}${absolute.pathname}`);
+    } catch {
+        return null;
+    }
 }

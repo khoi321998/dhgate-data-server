@@ -1,111 +1,60 @@
 import { log } from 'apify';
-import type { Frame, Page } from 'playwright';
+import type { Page } from 'playwright';
 
-const LOGO_SELECTOR = '.j-paymentListImg .paymentitem img';
-const CLICK_TIMEOUT_MS = 5_000;
-const WAIT_TIMEOUT_MS = 10_000;
-// `locator.count()` takes no timeout of its own and stalls on a frame that has no execution context
-// yet (an ad/tracker iframe mid-navigation). On a CPU-starved container that stall was what pushed
-// this step to ~31s against a nominal 15s, so every probe gets its own short ceiling.
-const FRAME_PROBE_TIMEOUT_MS = 1_000;
-
-/** Resolves to `fallback` if `promise` has not settled within `ms`. */
-async function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
-    let timer: NodeJS.Timeout | undefined;
-    const timeout = new Promise<T>((resolve) => {
-        timer = setTimeout(() => resolve(fallback), ms);
-    });
-    try {
-        return await Promise.race([promise.catch(() => fallback), timeout]);
-    } finally {
-        clearTimeout(timer);
-    }
-}
+/** The API the "Buyer Protection" modal itself calls for its payment logos. */
+const PAYMENT_ICONS_API = 'https://shoppingcart.dhgate.com/order/getPaymentMethodIcons.do';
+const REQUEST_TIMEOUT_MS = 10_000;
 
 /**
- * The payment logo list is rendered by a separately-fetched "Buyer Protection"
- * mini-page (own <title>/<meta>, m.dhgate.com-authored) that DHGate embeds into
- * the modal — it may land in the main document or an iframe depending on build,
- * so poll every frame rather than assuming one.
+ * Extract the accepted payment methods (as logo image URLs).
  *
- * The deadline is checked before every frame probe, not once per sweep: a sweep
- * over DHGate's many iframes can itself take seconds, and checking only at the
- * end let the last sweep run far past the budget.
- */
-async function waitForPaymentFrame(page: Page, timeoutMs: number): Promise<Frame | null> {
-    const deadline = Date.now() + timeoutMs;
-    const mainFrame = page.mainFrame();
-    while (Date.now() < deadline) {
-        // Main document first: it is the cheapest probe and the most common home of the list.
-        const frames = [mainFrame, ...page.frames().filter((f) => f !== mainFrame)];
-        for (const frame of frames) {
-            const remaining = deadline - Date.now();
-            if (remaining <= 0) return null;
-            if (frame.isDetached()) continue;
-            const count = await withTimeout(
-                frame.locator(LOGO_SELECTOR).count(),
-                Math.min(FRAME_PROBE_TIMEOUT_MS, remaining),
-                0,
-            );
-            if (count > 0) return frame;
-        }
-        await page.waitForTimeout(250);
-    }
-    return null;
-}
-
-/**
- * Extract the accepted payment methods (as logo image URLs) from the
- * "Buyer Protection" modal.
- *
- * The list is NOT present in the initial DOM: clicking the trigger
- * (`[spm-c="buyPtc"]`) opens the modal, whose content itself fires an XHR
- * (`getPaymentMethodIcons.do`) and replaces `.j-paymentListImg` with `<img>`
- * logos localized to the buyer's shipping country. We wait for that
- * replacement, then read each logo's `src` — filenames aren't a reliable
- * naming scheme (e.g. "klarna2024", "Google_Pay"), so the URL is kept as-is.
+ * They are the logos of the "Buyer Protection" modal (`[spm-c="buyPtc"]`), which are not in the
+ * page: the modal's own script fetches them from {@link PAYMENT_ICONS_API} for the buyer's ship-to
+ * country and fills `.j-paymentListImg` with one `<img>` per `data.paymentList[].logo`. Opening the
+ * modal to wait for that — click, poll every frame, press Escape — cost up to 10 s and left the modal
+ * up when Escape did not close it, so the same request is made here instead, from the page, with
+ * its cookies and through its proxy, exactly as the modal makes it. Filenames are not a reliable
+ * naming scheme (e.g. "klarna2024", "Google_Pay"), so the URLs are kept as-is.
  */
 export async function extractPaymentMethods(page: Page): Promise<string[]> {
     const startedAt = Date.now();
-    const trigger = page.locator('[spm-c="buyPtc"]').first();
-    if ((await trigger.count()) === 0) {
-        log.debug('[paymentMethods] no Buyer Protection trigger on the page');
-        return [];
-    }
+    // No named functions inside: `tsx` (esbuild) wraps them in `__name(...)`, which the page lacks.
+    const result = await page
+        .evaluate(
+            async ({ api, timeoutMs }) => {
+                const shipToCountry = /(?:^|;\s*)b2b_ship_country=([^;]*)/.exec(document.cookie)?.[1] ?? '';
+                const language = /(?:^|;\s*)language=([^;]*)/.exec(document.cookie)?.[1] ?? 'en';
+                const url = `${api}?shipToCountry=${shipToCountry}&buyerId=&language=${language}&client=pc`;
+                const ac = new AbortController();
+                const timer = setTimeout(() => ac.abort(), timeoutMs);
+                try {
+                    const res = await fetch(url, { credentials: 'include', mode: 'cors', signal: ac.signal });
+                    const body = (await res.json()) as {
+                        state?: string;
+                        data?: { paymentList?: { logo?: string }[] };
+                    };
+                    if (body.state !== '0x0000') return { error: `API answered state ${body.state ?? '?'}` };
+                    return { logos: (body.data?.paymentList ?? []).map((item) => item.logo ?? '') };
+                } catch (error) {
+                    return { error: (error as Error).message };
+                } finally {
+                    clearTimeout(timer);
+                }
+            },
+            { api: PAYMENT_ICONS_API, timeoutMs: REQUEST_TIMEOUT_MS },
+        )
+        .catch((error: Error) => ({ error: error.message.split('\n')[0] }));
 
-    // The click failing used to be swallowed silently, leaving "(none)" indistinguishable from a
-    // modal that opened but never received its logos. Keep the reason so the log can tell them apart.
-    let clickError: string | null = null;
-    await trigger.click({ timeout: CLICK_TIMEOUT_MS }).catch((error: Error) => {
-        clickError = error.message.split('\n')[0];
-    });
-    const clickMillis = Date.now() - startedAt;
-
-    const frame = await waitForPaymentFrame(page, WAIT_TIMEOUT_MS);
-    const waitMillis = Date.now() - startedAt - clickMillis;
-    await page.keyboard.press('Escape').catch(() => {});
-
-    const timing = { clickMillis, waitMillis, frames: page.frames().length };
-    if (!frame) {
-        log.warning(
-            `[paymentMethods] no payment logos found — ${clickError ? `click failed: ${clickError}` : 'clicked, but the list never rendered'}`,
-            timing,
-        );
+    const millis = Date.now() - startedAt;
+    if ('error' in result) {
+        log.warning(`[paymentMethods] no payment logos — ${result.error}`, { millis });
         return [];
     }
 
     const urls: string[] = [];
-    const seen = new Set<string>();
-    for (const el of await frame.locator(LOGO_SELECTOR).all()) {
-        const src = await el.getAttribute('src');
-        if (!src || seen.has(src)) continue;
-        seen.add(src);
-        urls.push(src);
+    for (const logo of result.logos) {
+        if (logo && !urls.includes(logo)) urls.push(logo);
     }
-
-    const totalMillis = Date.now() - startedAt;
-    // Only surface timings when the step was slow — that is the case worth diagnosing.
-    const report = totalMillis > 5_000 ? log.info.bind(log) : log.debug.bind(log);
-    report('[paymentMethods] done', { ...timing, totalMillis, logos: urls.length });
+    if (urls.length === 0) log.warning('[paymentMethods] the API listed no payment methods', { millis });
     return urls;
 }

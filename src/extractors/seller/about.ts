@@ -35,12 +35,22 @@ const LABEL_TO_KEY: Record<string, keyof SellerAbout> = {
  * stays compact.
  */
 export async function extractSellerAbout(page: Page): Promise<SellerAbout | null> {
+    const aboutUrl = await readAboutUrl(page);
+    return aboutUrl ? extractSellerAboutAt(page, aboutUrl) : null;
+}
+
+/** The About Us link from the store nav, without query / hash; null when the page has none. */
+export async function readAboutUrl(page: Page): Promise<string | null> {
     const aboutLink = page.locator('a[spm-c="oncabout"]').first();
     if ((await aboutLink.count()) === 0) return null;
+    return stripUrlParams(await aboutLink.getAttribute('href'));
+}
 
-    const aboutUrl = stripUrlParams(await aboutLink.getAttribute('href'));
-    if (!aboutUrl) return null;
-
+/**
+ * {@link extractSellerAbout} for a known About Us URL: navigates `page` there. The seller handler
+ * passes a second tab, so the About tab loads while the store's own tab goes on to the reviews.
+ */
+export async function extractSellerAboutAt(page: Page, aboutUrl: string): Promise<SellerAbout | null> {
     // 'commit' (not 'domcontentloaded'): the data is server-rendered in .col-main, but
     // DHGate's body ends with a pile of heavy synchronous inline scripts whose execution
     // delays DOMContentLoaded. Resolve as soon as navigation commits and gate on the

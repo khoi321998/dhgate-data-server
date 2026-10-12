@@ -12,6 +12,7 @@ import { Actor } from 'apify';
 import { chromium as patchrightChromium } from 'patchright';
 import type { BrowserType } from 'playwright';
 
+import { intEnv, MAX_REQUEST_RETRIES, PARALLEL_SELLER } from './config.js';
 // this is ESM project, and as such, it requires you to specify extensions in your relative imports
 // note that we need to use `.js` even when inside TS files
 import type { CaptureMode, ProductSellerResponse } from './dto/index.js';
@@ -20,12 +21,15 @@ import { createJob, describeJob, dropJob, isOrphan, jobCount, jobOf } from './jo
 import { log, runWithJobPrefix } from './logger.js';
 import { pushItem } from './push.js';
 import { createRouter, DEFAULT_MODE, LABELS, modeOf } from './routes.js';
+import { blockUnneededRequests } from './utils/blocking.js';
 import { chooseChrome } from './utils/browser.js';
 import { passCloudflare } from './utils/cloudflare.js';
 import { emptyResponse } from './utils/defaults.js';
 import { DEFAULT_SHIP_COUNTRY, extractDhgateShipCountry, normalizeDhgateHost } from './utils/parse.js';
-import { describeProxy, pickProxy } from './utils/proxy.js';
+import { startQueuedNow } from './utils/pool.js';
+import { describeProxy, proxyChoiceFromEnv } from './utils/proxy.js';
 import { reportedUrl } from './utils/request.js';
+import { logPageErrors } from './utils/tabs.js';
 
 /**
  * DHGate scraping HTTP server: keeps one crawler (and its browser) warm and scrapes one URL per request.
@@ -35,31 +39,28 @@ import { reportedUrl } from './utils/request.js';
  *   GET  /        -> health / status (no auth, for health checks)
  *
  * Env vars: API_KEY (required), PORT (8080), MAX_CONCURRENCY (4), MAX_QUEUE (100), MAX_REQUEST_RETRIES (3),
- * JOB_TIMEOUT_SECS (900), USE_APIFY_PROXY (true) + APIFY_PROXY_PASSWORD.
+ * JOB_TIMEOUT_SECS (900), PARALLEL_SELLER (true), APIFY_PROXY_GROUPS (empty = no proxy, DATACENTER or
+ * RESIDENTIAL) + APIFY_PROXY_PASSWORD, APIFY_PROXY_COUNTRY (US).
+ *
+ * Every request — and every retry of it — runs in a browser of its own, launched for it on a new session
+ * (so a new proxy IP) and closed after it. A `product_and_seller` request opens its store page in a
+ * second tab of that browser.
  */
-
-function intEnv(name: string, fallback: number, min = 1): number {
-    const raw = process.env[name];
-    if (raw === undefined || raw === '') return fallback;
-    const value = Number(raw);
-    if (!Number.isInteger(value) || value < min) throw new Error(`Env var ${name} must be an integer >= ${min}, got "${raw}".`);
-    return value;
-}
 
 const API_KEY = process.env.API_KEY ?? '';
 if (API_KEY.length < 16) throw new Error('Env var API_KEY is required and must be at least 16 characters.');
 
 const PORT = intEnv('PORT', 8080);
-// Browser pages open at once. Requests beyond this wait in the crawler's queue, in FIFO order.
+// Requests scraped at once, each in its own browser. Requests beyond this wait in the crawler's queue, in
+// FIFO order.
 const MAX_CONCURRENCY = intEnv('MAX_CONCURRENCY', 4);
 // Requests running or waiting. Beyond this the server answers 503.
 const MAX_QUEUE = intEnv('MAX_QUEUE', 100);
-// Retries per page after the first attempt, each on a new session (and so a new proxy IP).
-const MAX_REQUEST_RETRIES = intEnv('MAX_REQUEST_RETRIES', 3, 0);
 // A request still without a row after this long is answered with an error, so a caller never hangs forever.
 const JOB_TIMEOUT_MS = intEnv('JOB_TIMEOUT_SECS', 900) * 1000;
-// On by default, like the Actor's `enableProxy`: see utils/proxy.ts for why DHGate should not be hit bare.
-const USE_APIFY_PROXY = process.env.USE_APIFY_PROXY !== 'false';
+// A request's handler covers its product page and — in a parallel tab — its store page with the About and
+// Review tabs, which through the proxy can take well over Crawlee's default 60 s.
+const REQUEST_HANDLER_TIMEOUT_SECS = 180;
 const MAX_BODY_BYTES = 64 * 1024;
 const MEMORY_LOG_INTERVAL_MS = 10 * 60_000;
 // A finished job's queue entries (which hold the scraped product) are deleted after this delay, so memory
@@ -70,18 +71,17 @@ const VALID_MODES: readonly CaptureMode[] = ['product_only', 'product_and_seller
 
 // --- Proxy: Apify is used only for its residential proxy (needs APIFY_PROXY_PASSWORD, no Actor.init). ---
 
-// The exit itself is fixed in code (Apify residential US) — see utils/proxy.ts for why that is not
-// a preference on a Cloudflare-fronted site. The env var only decides whether to use it at all.
-const proxyChoice = pickProxy(USE_APIFY_PROXY);
+// APIFY_PROXY_GROUPS: empty = no proxy, DATACENTER or RESIDENTIAL — see utils/proxy.ts.
+const proxyChoice = proxyChoiceFromEnv(process.env);
 
-// With the switch off we do not even ask the SDK. With it on, `undefined` back from here is a
-// problem rather than a choice — Apify Proxy was asked for and could not be reached — so the server
-// refuses to start instead of hitting DHGate from its own IP.
+// Without a proxy we do not even ask the SDK. With one, `undefined` back from here is a problem
+// rather than a choice — Apify Proxy was asked for and could not be reached — so the server refuses
+// to start instead of hitting DHGate from its own IP.
 const proxyConfiguration = proxyChoice.enabled ? await Actor.createProxyConfiguration(proxyChoice.settings) : undefined;
 if (proxyConfiguration) {
     log.info(`Proxy: ${describeProxy(proxyChoice)}`);
 } else if (!proxyChoice.enabled) {
-    log.info('Proxy: none — disabled by `USE_APIFY_PROXY=false`; hitting DHGate from this machine’s own IP');
+    log.info('Proxy: none — APIFY_PROXY_GROUPS is empty; hitting DHGate from this machine’s own IP');
 } else {
     throw new Error('Failed to create Apify proxy configuration. Is APIFY_PROXY_PASSWORD set?');
 }
@@ -151,14 +151,28 @@ const crawler = new DhgateCrawler(
         proxyConfiguration,
         // The server feeds the crawler for as long as it runs: an empty queue means "wait", not "done".
         keepAlive: true,
+        // Fixed, not autoscaled: Crawlee's pool starts at 1 page and adds one every 10 s while the machine
+        // looks idle (and drops back when headed Chrome spikes the CPU), so after every start — and under
+        // load — requests and a product's parallel store page ran one at a time. The operator sizes
+        // MAX_CONCURRENCY to the machine instead.
+        minConcurrency: MAX_CONCURRENCY,
         maxConcurrency: MAX_CONCURRENCY,
         maxRequestRetries: MAX_REQUEST_RETRIES,
+        requestHandlerTimeoutSecs: REQUEST_HANDLER_TIMEOUT_SECS,
+        // Nothing carries over from one request to the next: each browser starts on a fresh session
+        // with no cookies.
+        persistCookiesPerSession: false,
         // Crawlee treats 403 as "blocked" and throws in its own response handler, before any of our
         // code — including the challenge wait below — gets a say. But on DHGate every first hit is a
         // 403: that is what the Cloudflare interstitial is served with, and it clears itself seconds
         // later. So 403 is taken off this list and judged after the wait instead, by `detectBlocked`
         // in the handlers, which by then knows whether the challenge actually passed.
-        sessionPoolOptions: { blockedStatusCodes: [401, 429] },
+        sessionPoolOptions: {
+            blockedStatusCodes: [401, 429],
+            // A browser is launched with a session and keeps it, so a session used once is never handed
+            // to the next browser: each request (and each retry) gets a new session, so a new proxy IP.
+            sessionOptions: { maxUsageCount: 1 },
+        },
         requestHandler: createRouter(),
         // Runs between a failed attempt and the next one (not after the last retry —
         // that is `failedRequestHandler`), so awaiting here delays only the retry.
@@ -178,10 +192,7 @@ const crawler = new DhgateCrawler(
                 const { request } = ctx;
                 // Report the caller's original URL, not the normalized one we actually navigated to.
                 const url = reportedUrl(request);
-                // A seller request carries the product already scraped off the PDP: keep it rather than
-                // lose a good product to a store page we could not reach.
-                const { partialResponse } = request.userData as { partialResponse?: ProductSellerResponse };
-                const row = partialResponse ?? emptyResponse(url, modeOf(request));
+                const row = emptyResponse(url, modeOf(request));
                 row.success = false;
                 row.errorCode = 'FETCH_FAILED';
                 row.errorMessage = `gave up after ${request.retryCount} retries: ${(error as Error).message}`;
@@ -208,6 +219,10 @@ const crawler = new DhgateCrawler(
                 // than letting the previous request's country leak into this one.
                 const { shipCountry = DEFAULT_SHIP_COUNTRY } = request.userData as { shipCountry?: string };
                 await page.context().addCookies(localeCookies(shipCountry));
+                // Each attempt has a page (and browser) of its own, so this is registered once per page.
+                logPageErrors(page, request.label ?? 'page');
+                // Images, video, fonts and trackers never go out through the proxy — see utils/blocking.ts.
+                await blockUnneededRequests(page);
             },
         ],
         postNavigationHooks: [
@@ -225,6 +240,18 @@ const crawler = new DhgateCrawler(
             // with `addInitScript`, which is one of the things Patchright exists to keep off the page.
             // A real Chrome's own consistent fingerprint beats a fabricated one.
             useFingerprints: !chrome.useChrome,
+            // One browser per request: a page never shares a browser, and a browser is retired after its
+            // page — closed once that page is — so the next request or retry launches a new one. A page
+            // that crashed, got challenged or broke DHGate's app cannot leak into another request.
+            // (The store-page tab a request opens itself is not one of Crawlee's pages.)
+            maxOpenPagesPerBrowser: 1,
+            retireBrowserAfterPageCount: 1,
+            postLaunchHooks: [
+                (_pageId, browserController) => {
+                    const session = browserController.launchContext.session as { id?: string } | undefined;
+                    log.info(`Launched a new browser (session ${session?.id ?? 'none'}, ${describeBrowsers()})`);
+                },
+            ],
             prePageCreateHooks: [
                 (_pageId, _controller, pageOptions) => {
                     // Playwright's default 1280x720 viewport is applied through the CDP call
@@ -276,9 +303,21 @@ const crawler = new DhgateCrawler(
 
 let inProgress = 0;
 
+/** Browsers in use / retired but still closing, for logs and the health check. */
+function browserStats() {
+    // Read lazily: the pool exists from construction, but this is also called from its own launch hook.
+    const pool = crawler.browserPool;
+    return { active: pool.activeBrowserControllers.size, retired: pool.retiredBrowserControllers.size };
+}
+
+function describeBrowsers(): string {
+    const { active, retired } = browserStats();
+    return `browsers: ${active} active, ${retired} retiring`;
+}
+
 /** Current load, for logs. */
 function describeLoad(): string {
-    return `in progress: ${inProgress}/${MAX_QUEUE}, max concurrency: ${MAX_CONCURRENCY}`;
+    return `in progress: ${inProgress}/${MAX_QUEUE}, max concurrency: ${MAX_CONCURRENCY}, ${describeBrowsers()}`;
 }
 
 // --- HTTP helpers ---
@@ -451,6 +490,8 @@ async function handleScrape(req: IncomingMessage, res: ServerResponse) {
     try {
         log.info(`Received ${described} (mode: ${mode}, ${describeLoad()})`);
         await runWithJobPrefix(described, async () => crawler.addRequests([startRequest(job)]));
+        // Start it now rather than on the pool's next check — see `startQueuedNow` in utils/pool.ts.
+        startQueuedNow(crawler);
 
         const row = await waitForRow(job);
         const t = timing(job);
@@ -485,7 +526,14 @@ const server = createServer((req, res) => {
     const path = new URL(req.url ?? '/', 'http://localhost').pathname;
 
     if (req.method === 'GET' && path === '/') {
-        sendJson(res, 200, { status: 'ok', maxConcurrency: MAX_CONCURRENCY, maxQueue: MAX_QUEUE, inProgress, jobs: jobCount() });
+        sendJson(res, 200, {
+            status: 'ok',
+            maxConcurrency: MAX_CONCURRENCY,
+            maxQueue: MAX_QUEUE,
+            inProgress,
+            jobs: jobCount(),
+            browsers: browserStats(),
+        });
         return;
     }
 
@@ -532,7 +580,8 @@ server.listen(PORT, () => {
         MAX_QUEUE,
         MAX_REQUEST_RETRIES,
         JOB_TIMEOUT_SECS: JOB_TIMEOUT_MS / 1000,
-        USE_APIFY_PROXY,
+        PARALLEL_SELLER,
+        APIFY_PROXY: describeProxy(proxyChoice),
         APIFY_PROXY_PASSWORD: process.env.APIFY_PROXY_PASSWORD ? 'set' : 'not set',
         API_KEY: 'set',
     });
