@@ -1,0 +1,42 @@
+{
+	"name": "dhgate-data-server",
+	"version": "0.0.1",
+	"type": "module",
+	"description": "HTTP server that scrapes one DHGate product or seller URL per request",
+	"engines": {
+		"node": ">=18.0.0"
+	},
+	"dependencies": {
+		"@crawlee/playwright": "^3.15.3",
+		"apify": "^3.7.0",
+		"patchright": "^1.62.3",
+		"playwright": "1.60.0"
+	},
+	"devDependencies": {
+		"@apify/eslint-config": "^2.0.0",
+		"@apify/tsconfig": "^0.1.1",
+		"@types/node": "^24.0.0",
+		"eslint": "^9.29.0",
+		"eslint-config-prettier": "^10.1.5",
+		"globals": "^17.0.0",
+		"prettier": "^3.5.3",
+		"tsx": "^4.20.3",
+		"typescript": "^6.0.0",
+		"typescript-eslint": "^8.58.0",
+		"vitest": "^4.1.0"
+	},
+	"scripts": {
+		"start": "npm run start:dev",
+		"start:prod": "node --env-file-if-exists=.env dist/server.js",
+		"start:dev": "tsx --env-file-if-exists=.env src/server.ts",
+		"build": "tsc",
+		"lint": "eslint",
+		"lint:fix": "eslint --fix",
+		"format": "prettier --write .",
+		"format:check": "prettier --check .",
+		"test": "vitest run",
+		"postinstall": "npx crawlee install-playwright-browsers"
+	},
+	"author": "It's not you it's me",
+	"license": "ISC"
+}

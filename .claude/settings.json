@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e ' *)",
+      "Bash(node \"C:/Users/khoit/AppData/Local/Temp/claude/d--ApifyScript-DhGatePlatform-dhgate-data-scraper/4ebf15e2-9612-4f90-9a47-4149d04fe41e/scratchpad/verify-position.mjs\")",
+      "Bash(node ./verify-position.tmp.mjs)",
+      "Bash(apify validate-schema *)",
+      "PowerShell(npx eslint src/utils/cloudflare.ts src/utils/proxy.ts src/dto/input.ts test/proxy.test.ts)",
+      "PowerShell(git checkout 3961517 -- src/utils/proxy.ts .actor/input_schema.json src/dto/input.ts src/main.ts test/proxy.test.ts)",
+      "PowerShell(git restore --staged .actor/input_schema.json src/dto/input.ts src/main.ts src/utils/proxy.ts test/proxy.test.ts)",
+      "PowerShell(npx vitest run test/proxy.test.ts 2>&1)"
+    ]
+  }
+}
