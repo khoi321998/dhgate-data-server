@@ -6,11 +6,16 @@ import type {
     SellerServiceScore,
     SellerServiceScoreItem,
 } from '../../dto/index.js';
+import { log } from 'apify';
+
 import { settleCloudflareChallenge } from '../../utils/cloudflare.js';
 import { stripUrlParams, parseCompactNumber, parseAmount } from '../../utils/parse.js';
 
 /** Cap on how many seller reviews we keep per review type. */
 const MAX_REVIEWS_PER_TYPE = 5;
+
+/** Budget for each filtered review page fetched by {@link fetchReviewBuckets}. */
+const REVIEW_FETCH_TIMEOUT_MS = 15_000;
 
 /**
  * The "Reviews:" dropdown options we sample, with the `data-status` each one carries.
@@ -187,13 +192,165 @@ function parseIndustry(text: string): string | null {
  */
 async function extractReviewSamples(page: Page): Promise<SellerReviewSamples> {
     const reviews: SellerReviewSamples = { positive: [], neutral: [], negative: [] };
+    const allStatuses = REVIEW_TYPES.map((t) => t.status);
+    const fetched = await fetchReviewBuckets(page, allStatuses);
+    // The store now and then answers a filtered request with another filter (seen: Positive coming
+    // back as "All"). Asking again usually gets the right one, still without a page load.
+    const missed = allStatuses.filter((status) => !('samples' in (fetched.get(status) ?? { error: '' })));
+    if (missed.length > 0 && missed.length < allStatuses.length) {
+        for (const [status, bucket] of await fetchReviewBuckets(page, missed)) {
+            if ('samples' in bucket) fetched.set(status, bucket);
+        }
+    }
     for (const { type, status } of REVIEW_TYPES) {
+        const bucket = fetched.get(status);
+        if (bucket && 'samples' in bucket) {
+            reviews[type] = bucket.samples;
+            continue;
+        }
+        log.warning(
+            `[seller] ${type} reviews: ${bucket?.error ?? 'not fetched'} — switching the filter on the page instead`,
+        );
         // A filter we cannot switch to is left empty rather than sampled: re-reading the list
         // would just file the previous type's cards under the wrong one.
         if (!(await selectReviewType(page, status))) continue;
         reviews[type] = await extractReviews(page);
     }
     return reviews;
+}
+
+type ReviewBucket = { samples: SellerReviewSample[] } | { error: string };
+
+/** One filter's cards as read in the page — raw strings, parsed afterwards like `extractReviews` parses its cards. */
+interface RawBucket {
+    status: string;
+    error?: string;
+    cards?: {
+        user: string;
+        country: string;
+        ratingStyle: string | null;
+        reviewDate: string;
+        comment: string;
+        helpful: string;
+        unhelpful: string;
+    }[];
+}
+
+/**
+ * All three review filters without loading a page per filter.
+ *
+ * The "Reviews:" dropdown only sets `#score` and submits `SellerscoreActionForm`, a plain GET form.
+ * So the same URLs the form would load are fetched from this page — same origin, its cookies — and
+ * their HTML is parsed with `DOMParser`, which neither renders it nor runs its scripts. Switching the
+ * filter on the page reloaded the whole store page, scripts and all, once per filter. Each response is checked the way the page switch was: its `#score`
+ * must be the filter asked for. A filter that fails here is left out of the map, and
+ * {@link extractReviewSamples} switches it on the page instead.
+ */
+async function fetchReviewBuckets(page: Page, statuses: string[]): Promise<Map<string, ReviewBucket>> {
+    // No named functions inside: `tsx` (esbuild) wraps them in `__name(...)`, which the page lacks.
+    const raw = await page
+        .evaluate(
+            async ({ wanted, max, timeoutMs }) => {
+                const form = document.querySelector('form[name="SellerscoreActionForm"]') as HTMLFormElement | null;
+                if (!form) return null;
+                // One after the other: the store keeps the filter in the session, and parallel requests
+                // were seen answering with each other's filter (Positive came back as Neutral).
+                const results: RawBucket[] = [];
+                for (const status of wanted) {
+                    results.push(
+                        await (async (): Promise<RawBucket> => {
+                            const ac = new AbortController();
+                            const timer = setTimeout(() => ac.abort(), timeoutMs);
+                            try {
+                                const data = new FormData(form);
+                                data.set('score', status);
+                                data.set('page', '1');
+                                const query = new URLSearchParams(data as unknown as string[][]).toString();
+                                const res = await fetch(`${form.action}?${query}`, {
+                                    credentials: 'include',
+                                    signal: ac.signal,
+                                });
+                                if (!res.ok) return { status, error: `HTTP ${res.status}` };
+                                const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+                                const applied = (doc.querySelector('#score') as HTMLInputElement | null)?.value ?? null;
+                                if (applied !== status) {
+                                    return { status, error: `the filter did not apply (score=${applied})` };
+                                }
+                                const cards = Array.from(doc.querySelectorAll('.review-list-pro'))
+                                    .slice(0, max)
+                                    .map((card) => ({
+                                        user: (card.querySelector('.user-info p')?.textContent ?? '')
+                                            .replace(/\s+/g, ' ')
+                                            .trim(),
+                                        country: (card.querySelector('.review-country .country')?.textContent ?? '')
+                                            .replace(/\s+/g, ' ')
+                                            .trim(),
+                                        ratingStyle:
+                                            card.querySelector('.review-list-rate b')?.getAttribute('style') ?? null,
+                                        reviewDate: (card.querySelector('.review-list-time')?.textContent ?? '')
+                                            .replace(/\s+/g, ' ')
+                                            .trim(),
+                                        comment: (card.querySelector('dd p')?.textContent ?? '')
+                                            .replace(/\s+/g, ' ')
+                                            .trim(),
+                                        helpful: (card.querySelector('.review-text1')?.textContent ?? '')
+                                            .replace(/\s+/g, ' ')
+                                            .trim(),
+                                        unhelpful: (
+                                            Array.from(card.querySelectorAll('.review-text3')).pop()?.textContent ?? ''
+                                        )
+                                            .replace(/\s+/g, ' ')
+                                            .trim(),
+                                    }));
+                                return { status, cards };
+                            } catch (error) {
+                                return { status, error: (error as Error).message };
+                            } finally {
+                                clearTimeout(timer);
+                            }
+                        })(),
+                    );
+                }
+                return results;
+            },
+            {
+                wanted: statuses,
+                max: MAX_REVIEWS_PER_TYPE,
+                timeoutMs: REVIEW_FETCH_TIMEOUT_MS,
+            },
+        )
+        .catch((error: Error) => [{ status: '*', error: error.message.split('\n')[0] }]);
+
+    const buckets = new Map<string, ReviewBucket>();
+    if (!raw) {
+        for (const status of statuses) buckets.set(status, { error: 'no review filter form on the page' });
+        return buckets;
+    }
+    for (const result of raw) {
+        const cards = 'cards' in result ? result.cards : undefined;
+        if (!cards) {
+            const error = ('error' in result && result.error) || 'no result';
+            if (result.status === '*') {
+                for (const status of statuses) buckets.set(status, { error });
+            } else {
+                buckets.set(result.status, { error });
+            }
+            continue;
+        }
+        // Parsed as the page switch parsed its cards (see `extractReviews`).
+        buckets.set(result.status, {
+            samples: cards.map((card) => ({
+                user: card.user.replace(/^By:\s*/i, '') || null,
+                country: card.country || null,
+                rating: ratingFromWidth(card.ratingStyle),
+                reviewDate: card.reviewDate || null,
+                comment: card.comment || null,
+                helpfulCount: parseCompactNumber(card.helpful),
+                unhelpfulCount: parseUnhelpful(card.unhelpful),
+            })),
+        });
+    }
+    return buckets;
 }
 
 /**
@@ -239,7 +396,11 @@ async function selectReviewType(page: Page, status: string): Promise<boolean> {
 async function extractReviews(page: Page): Promise<SellerReviewSample[]> {
     // The wrapper renders even when the filter matches nothing, so gate on it rather than on
     // the cards — an empty Negative bucket must not cost a 10s timeout.
-    await page.locator('.review-new-warp').first().waitFor({ state: 'attached', timeout: 10_000 }).catch(() => {});
+    await page
+        .locator('.review-new-warp')
+        .first()
+        .waitFor({ state: 'attached', timeout: 10_000 })
+        .catch(() => {});
 
     const cards = page.locator('.review-list-pro');
     if ((await cards.count()) === 0) return [];
