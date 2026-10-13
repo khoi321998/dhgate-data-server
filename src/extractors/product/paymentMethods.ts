@@ -2,7 +2,7 @@ import { log } from 'apify';
 import type { Page } from 'playwright';
 
 /** The API the "Buyer Protection" modal itself calls for its payment logos. */
-const PAYMENT_ICONS_API = 'https://shoppingcart.dhgate.com/order/getPaymentMethodIcons.do';
+export const PAYMENT_ICONS_API = 'https://shoppingcart.dhgate.com/order/getPaymentMethodIcons.do';
 const REQUEST_TIMEOUT_MS = 10_000;
 
 /**

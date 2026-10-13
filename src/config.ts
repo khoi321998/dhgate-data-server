@@ -36,3 +36,10 @@ export const CRASH_GUARD = process.env.CRASH_GUARD !== 'false';
 
 /** `PARALLEL_SELLER=false` opens the store page only after the product page is done. */
 export const PARALLEL_SELLER = process.env.PARALLEL_SELLER !== 'false';
+
+/**
+ * `PRODUCT_OVER_HTTP=false` always scrapes in a browser. On by default: a request is first scraped
+ * over HTTP — the product page, its APIs and the store pages, no browser — and only goes to the
+ * browser when that gives up (a refusal, a challenge, data it cannot read). See `src/http-path.ts`.
+ */
+export const PRODUCT_OVER_HTTP = process.env.PRODUCT_OVER_HTTP !== 'false';

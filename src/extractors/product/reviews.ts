@@ -1,7 +1,7 @@
 import type { Page } from 'playwright';
 import type { ReviewSample, RatingBreakdown } from '../../dto/index.js';
 
-const REVIEWS_API = 'https://www.dhgate.com/reviewbuyer/reviewOfProd/pageReviewOfProd';
+export const REVIEWS_API = 'https://www.dhgate.com/reviewbuyer/reviewOfProd/pageReviewOfProd';
 /** Per call; a call the proxy hangs must not hold the product page's first read group. */
 const REQUEST_TIMEOUT_MS = 10_000;
 const ATTEMPTS_PER_STAR = 2;
@@ -11,7 +11,7 @@ export interface ReviewsResult {
     reviewSamples: ReviewSample[];
 }
 
-interface RawReview {
+export interface RawReview {
     buyerNickname?: string;
     content?: string;
     score?: number;
@@ -19,7 +19,7 @@ interface RawReview {
     reviewAttach?: { imgs?: { imgUrl?: string }[] | null } | null;
 }
 
-function mapReview(raw: RawReview): ReviewSample {
+export function mapReview(raw: RawReview): ReviewSample {
     const images = (raw.reviewAttach?.imgs ?? [])
         .map((i) => i.imgUrl)
         .filter((u): u is string => typeof u === 'string');

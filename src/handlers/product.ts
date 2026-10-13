@@ -22,6 +22,7 @@ import { blockUnneededRequests } from '../utils/blocking.js';
 import { effectiveStatus, settleCloudflareChallenge } from '../utils/cloudflare.js';
 import { DEBUG_PAGE_ERRORS, readPageErrors } from '../utils/debug.js';
 import { emptyProduct, emptyResponse, emptySeller, errorResponse } from '../utils/defaults.js';
+import { createHttpClient } from '../utils/http.js';
 import { extractProductId, normalizeDhgateHost } from '../utils/parse.js';
 import { reportedUrl } from '../utils/request.js';
 import { logPageErrors, releasePage } from '../utils/tabs.js';
@@ -260,7 +261,7 @@ async function scrapeStore(
                 userAgent: await page.evaluate(() => navigator.userAgent),
                 cookieHeader: (await page.context().cookies(storeUrl)).map((c) => `${c.name}=${c.value}`).join('; '),
             };
-            const result = await scrapeStoreOverHttp(storeUrl, identity, log);
+            const result = await scrapeStoreOverHttp(storeUrl, createHttpClient(identity), log);
             if (result.kind === 'seller') return { row: sellerRow(outUrl, mode, result.seller) };
             log.warning(`[seller] store over HTTP gave up (${result.reason}) — loading it in a tab`);
         } catch (error) {

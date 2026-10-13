@@ -12,20 +12,22 @@ import { Actor } from 'apify';
 import { chromium as patchrightChromium } from 'patchright';
 import type { BrowserType } from 'playwright';
 
-import { CRASH_GUARD, intEnv, MAX_REQUEST_RETRIES, PARALLEL_SELLER } from './config.js';
+import { CRASH_GUARD, intEnv, MAX_REQUEST_RETRIES, PARALLEL_SELLER, PRODUCT_OVER_HTTP } from './config.js';
 // this is ESM project, and as such, it requires you to specify extensions in your relative imports
 // note that we need to use `.js` even when inside TS files
 import type { CaptureMode, ProductSellerResponse } from './dto/index.js';
+import { scrapeOverHttp } from './http-path.js';
 import type { Job } from './jobs.js';
 import { createJob, describeJob, dropJob, isOrphan, jobCount, jobOf } from './jobs.js';
 import { log, runWithJobPrefix } from './logger.js';
-import { pushItem } from './push.js';
+import { auditRow, pushItem } from './push.js';
 import { createRouter, DEFAULT_MODE, LABELS, modeOf } from './routes.js';
 import { blockUnneededRequests } from './utils/blocking.js';
 import { chooseChrome } from './utils/browser.js';
 import { passCloudflare } from './utils/cloudflare.js';
 import { DEBUG_PAGE_ERRORS, recordPageErrors } from './utils/debug.js';
 import { emptyResponse } from './utils/defaults.js';
+import { describeHttpError, setHttpRateLimit } from './utils/http.js';
 import { DEFAULT_SHIP_COUNTRY, extractDhgateShipCountry, normalizeDhgateHost } from './utils/parse.js';
 import { startQueuedNow } from './utils/pool.js';
 import { describeProxy, proxyChoiceFromEnv } from './utils/proxy.js';
@@ -86,6 +88,12 @@ if (proxyConfiguration) {
 } else {
     throw new Error('Failed to create Apify proxy configuration. Is APIFY_PROXY_PASSWORD set?');
 }
+
+// HTTP requests per second (the HTTP path, and store pages fetched over HTTP), 0 = no limit. Akamai
+// blocks an IP that asks too fast for ~10 minutes — the browser path with it — so from one IP (no
+// proxy, or a datacenter IP) they are paced; through the residential proxy each request has its own.
+const HTTP_MAX_RPS = intEnv('HTTP_MAX_RPS', proxyChoice.kind === 'RESIDENTIAL' ? 0 : 5, 0);
+setHttpRateLimit(HTTP_MAX_RPS);
 
 // Which browser binary we drive is the biggest single factor in how often Cloudflare challenges us,
 // so it is resolved and logged up front rather than buried in the launch options. See utils/browser.ts.
@@ -441,6 +449,35 @@ async function waitForRow(job: Job): Promise<ProductSellerResponse> {
     }
 }
 
+/**
+ * The job scraped without a browser (see `scrapeOverHttp`), or `null` when the HTTP path gave up and the
+ * job should go to the browser, as before.
+ */
+async function scrapeJobOverHttp(job: Job): Promise<ProductSellerResponse | null> {
+    const startedAt = Date.now();
+    // A proxy session of its own, as the browser path's: one IP for every request of the job.
+    const proxyUrl = await proxyConfiguration?.newUrl(`http_${job.id.replace(/-/g, '')}`);
+    const outcome = await scrapeOverHttp(job.url, job.mode, proxyUrl, log).catch((error: unknown) => ({
+        fallback: describeHttpError(error),
+    }));
+    if ('fallback' in outcome) {
+        log.warning(`HTTP path gave up after ${secs(Date.now() - startedAt)} — scraping in a browser: ${outcome.fallback}`);
+        return null;
+    }
+    auditRow(outcome.row, log);
+    // Only a field no live page lacks (id, title, price, seller id / name) sends the job to the browser:
+    // without it the page was not read. A missing `warning` field (specifications, delivery, …) can be
+    // genuinely absent from the listing, and the browser would find it empty too — so it stays as is.
+    if (outcome.row.extraction.status === 'broken') {
+        log.warning(
+            `HTTP path gave up after ${secs(Date.now() - startedAt)} — scraping in a browser: missing ${outcome.row.extraction.missingFields.join(', ')}`,
+        );
+        return null;
+    }
+    log.info(`Scraped over HTTP in ${secs(Date.now() - startedAt)}`);
+    return outcome.row;
+}
+
 /** Drop the job's finished queue entries — they hold the scraped row — once the crawler is done with them. */
 function scheduleQueueCleanup(job: Job) {
     setTimeout(() => {
@@ -497,11 +534,15 @@ async function handleScrape(req: IncomingMessage, res: ServerResponse) {
     const job = createJob({ id: randomUUID(), url, transactionId, mode });
     try {
         log.info(`Received ${described} (mode: ${mode}, ${describeLoad()})`);
-        await runWithJobPrefix(described, async () => crawler.addRequests([startRequest(job)]));
-        // Start it now rather than on the pool's next check — see `startQueuedNow` in utils/pool.ts.
-        startQueuedNow(crawler);
-
-        const row = await waitForRow(job);
+        // The HTTP path counts as the job's processing time, not its queue time.
+        if (PRODUCT_OVER_HTTP) job.startedAt = Date.now();
+        let row = PRODUCT_OVER_HTTP ? await runWithJobPrefix(described, async () => scrapeJobOverHttp(job)) : null;
+        if (!row) {
+            await runWithJobPrefix(described, async () => crawler.addRequests([startRequest(job)]));
+            // Start it now rather than on the pool's next check — see `startQueuedNow` in utils/pool.ts.
+            startQueuedNow(crawler);
+            row = await waitForRow(job);
+        }
         const t = timing(job);
         // Nothing scraped at all: the page never loaded through every retry. A row that kept a product
         // (seller page failed) or says "not found" is still an answer about the url, so it is a 200.
@@ -591,6 +632,8 @@ server.listen(PORT, () => {
         MAX_REQUEST_RETRIES,
         JOB_TIMEOUT_SECS: JOB_TIMEOUT_MS / 1000,
         PARALLEL_SELLER,
+        PRODUCT_OVER_HTTP,
+        HTTP_MAX_RPS,
         DEBUG_PAGE_ERRORS,
         CRASH_GUARD,
         APIFY_PROXY: describeProxy(proxyChoice),

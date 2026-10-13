@@ -90,6 +90,8 @@ docker run -d --name dhgate-server -p 8080:8080 --init --shm-size=1g --env-file 
 | `JOB_TIMEOUT_SECS` | `900` | A request with no result after this long gets `502` |
 | `PARALLEL_SELLER` | `true` | `product_and_seller`: start scraping the store as soon as the product page has loaded, instead of after the product is scraped. `false` = one after the other |
 | `CRASH_GUARD` | `true` | Give the product page an empty init script. DHGate's Next.js page crashes into "Application error" on ~1 in 6 attempts without it, and did not crash once with it (40 vs 40 requests, interleaved). The crash is then retried, so turning this off costs time, not data. An injected script is a trace bot detection can look for — the reason it can be turned off |
+| `PRODUCT_OVER_HTTP` | `true` | Scrape each request over plain HTTP first — the product page, the JSON APIs the page itself calls (SKU price, shipping, reviews, payment logos) and the store pages — with no browser at all. The request goes to the browser as before when that gives up (a refusal, a challenge, a price or page it cannot read). See [HTTP path](#http-path-no-browser). `false` = always a browser |
+| `HTTP_MAX_RPS` | `5`, `0` with `RESIDENTIAL` | HTTP requests per second across the server, `0` = no limit. Akamai blocks an IP that asks too fast (~85/s) for ~10 minutes, browser included; through the residential proxy each request has its own IP |
 | `STORE_OVER_HTTP` | `true` | Scrape the store, About and Review pages over plain HTTP (impit, Chrome's TLS fingerprint) as the request's browser — its proxy, user agent and cookies — instead of in browser tabs; a tab is opened only when HTTP fails. `false` = always tabs |
 | `DEBUG_PAGE_ERRORS` | `false` | Diagnosis only: record each page's JavaScript errors, failed requests and URL changes, and log them (`[crash debug]`) when DHGate's page crashes into "Application error". Injects a script into the page, which bot detection can notice — keep it off in production |
 | `APIFY_PROXY_PASSWORD` | | Required when `APIFY_PROXY_GROUPS` is set; the server refuses to start without it |
@@ -106,6 +108,28 @@ Measured over 20 sequential `product_and_seller` requests each (October 2026): ~
 ## Logs
 
 Every line of a request starts with its url and `transactionId`, so one request can be found with `docker logs dhgate-server 2>&1 | grep order-1234`. The lines are `Received ...`, the crawl steps (`... | [product] title: ...`, `... | [seller] header ...`, Cloudflare and retry lines), and then `Scraped ...` or `Scrape failed for ...`. A full queue logs `Rejected ...: server busy`.
+
+## HTTP path (no browser)
+
+With `PRODUCT_OVER_HTTP` on (the default), a request is first scraped without a browser, in [src/http-path.ts](src/http-path.ts): the product page's HTML and the JSON APIs the page itself calls, and — for `product_and_seller` and `seller_only` — the store, About and Review pages. Requests go through impit (Chrome's TLS fingerprint; Akamai answers Node's own client with 403), on a proxy session of their own, with the locale cookies the browser path sets.
+
+| Field | From |
+| --- | --- |
+| title, specifications, images, description, rating, review count, sold count, "N in stock", store link | the product page's HTML |
+| price, video, default SKU, seller id / avatar / positive feedback | the page's RSC flight data (`self.__next_f.push(…)`) |
+| stock, when the label is still its `0` placeholder | `pcskuprice.do` |
+| delivery time | `ship.do` |
+| rating breakdown, review samples | `pageReviewOfProd` (one call per star, in parallel) |
+| payment logos | `getPaymentMethodIcons.do` |
+| seller stats, previews, about, review samples | the store pages, as `STORE_OVER_HTTP` |
+
+It gives up — and the request goes to the browser exactly as before — on a refusal or challenge, an HTTP error, a page without a title, a price shown in a way not checked against the browser, an API that fails twice, or a row missing a field no live page lacks (id, title, price, seller id / name — the audit's `broken`). A field a listing can genuinely lack (specifications, delivery, …) does not send it to the browser: the row is returned as the APIs gave it. A product that does not exist is an answer (`ITEM_NOT_FOUND`), not a reason to give up.
+
+Compared with the browser path field by field (residential proxy, 8 products, `product_and_seller`): every request went over HTTP, in 5–11 s against 13–18 s, with the same row but for:
+
+- `seller.badges`: the product page's "About the Store" badges are written by DHGate's scripts (the HTML and RSC only have codes like `sellerTieringLevel: LV4`), so the row has the store page's badges instead;
+- `product.description.html`: the links lack the tracking parameters (`dspm`, `exposeflag`) DHGate's scripts add once the page runs;
+- `product.stock.availableQuantity` can differ between any two visits, on either path: DHGate renders the label with the real stock on one visit and the new-buyer promotion limit (often `1`) on another.
 
 ## Troubleshooting
 
@@ -124,6 +148,7 @@ Patchright puts an init script in by routing the page's document through itself.
 | --- | --- |
 | `Cloudflare challenge … still up … going for the checkbox`, `Clicking the Cloudflare checkbox`, retries `Cloudflare is still holding us on its challenge page` | 1. Make sure `DEBUG_PAGE_ERRORS` is off. 2. Set `CRASH_GUARD=false` and compare the block rate. The crashes come back (~1 in 6 attempts), but they are retried, so that costs time, not data |
 | `DHGate answered HTTP 403`, `DHGate served its "Access Denied" page` (Akamai) | Same as above, then look at the IP: with no proxy or `DATACENTER`, every request and every retry comes from one IP; switch to `RESIDENTIAL`. Lower `MAX_CONCURRENCY` if it happens under load |
+| `HTTP path gave up after … — scraping in a browser: …` | Expected now and then (the request is then scraped as before, just slower). If it is every request, the reason says why: `HTTP 403` / `refused or challenged` = Akamai is refusing impit (with no proxy, check `HTTP_MAX_RPS`); `the price is shown in a way not checked against the browser` = DHGate changed its pricing data. `missing …` = the HTML lacks a critical field — DHGate changed its markup. `PRODUCT_OVER_HTTP=false` turns the path off |
 | `[seller] store over HTTP gave up (refused or challenged at …)` | The store pages' HTTP client (impit) is being refused. Store data still comes through a browser tab; set `STORE_OVER_HTTP=false` to stop trying HTTP |
 
 ### DHGate's page crashes: "Application error: a client-side exception has occurred"

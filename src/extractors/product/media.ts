@@ -6,7 +6,7 @@ import type { Media } from '../../dto/index.js';
  * (e.g. `/webp/m/100x100/...`). The gallery thumbnails are 100x100; `/0x0/` returns
  * the original full-size image.
  */
-function toFullSize(url: string): string {
+export function toFullSize(url: string): string {
     return url.replace(/\/\d+x\d+\//, '/0x0/');
 }
 

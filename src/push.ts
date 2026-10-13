@@ -1,4 +1,4 @@
-import type { PlaywrightCrawlingContext } from '@crawlee/playwright';
+import type { Log, PlaywrightCrawlingContext } from '@crawlee/playwright';
 
 import type { ProductSellerResponse } from './dto/index.js';
 import { auditExtraction, ITEM_CHECKS, logExtractionReport } from './extraction-audit.js';
@@ -14,8 +14,15 @@ import { completeJob } from './jobs.js';
  * watching.
  */
 export async function pushItem(ctx: PlaywrightCrawlingContext, response: ProductSellerResponse): Promise<void> {
-    const { request, log } = ctx;
+    auditRow(response, ctx.log);
+    completeJob(ctx.request, response);
+}
 
+/**
+ * Audit a finished row against {@link ITEM_CHECKS} and log the outcome — for every row, whether the
+ * browser or the HTTP path scraped it.
+ */
+export function auditRow(response: ProductSellerResponse, log: Log): void {
     // Audited last, immediately before the push: auditing mid-pipeline would flag fields a
     // later extractor was still going to fill in.
     response.extraction = auditExtraction(response, ITEM_CHECKS);
@@ -29,6 +36,4 @@ export async function pushItem(ctx: PlaywrightCrawlingContext, response: Product
     if (response.extraction.checkedFields > 0) {
         logExtractionReport(response.extraction, log, response.url);
     }
-
-    completeJob(request, response);
 }

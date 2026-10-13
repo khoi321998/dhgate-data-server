@@ -1,7 +1,6 @@
 import type { Log } from '@crawlee/playwright';
 import type { CheerioAPI } from 'cheerio';
 import { load } from 'cheerio';
-import { Impit } from 'impit';
 
 import type {
     Seller,
@@ -11,6 +10,8 @@ import type {
     SellerServiceScoreItem,
 } from '../../dto/index.js';
 import { emptySeller } from '../../utils/defaults.js';
+import type { HttpClient } from '../../utils/http.js';
+import { describeHttpError } from '../../utils/http.js';
 import {
     extractSellerId,
     normalizeImageUrl,
@@ -23,19 +24,6 @@ import type { RawReviewCard } from './feedback.js';
 import { MAX_REVIEWS_PER_TYPE, parseIndustry, REVIEW_TYPES, reviewSamplesFromCards } from './feedback.js';
 import type { RawPreviewCard } from './products.js';
 import { previewsFromCards } from './products.js';
-
-/** Per-request budget; the browser tab is the fallback, so a slow fetch should give up early. */
-const HTTP_TIMEOUT_MS = 20_000;
-
-/**
- * Who the HTTP requests come from: the request's browser — its proxy (so its IP), its user agent and
- * its cookies (session, Akamai's) — so that to DHGate they are the same visitor as the product page.
- */
-export interface HttpIdentity {
-    proxyUrl?: string;
-    userAgent: string;
-    cookieHeader: string;
-}
 
 /** The seller, or why the HTTP path gave up — then the caller loads the store page in a tab instead. */
 export type StoreHttpResult = { kind: 'seller'; seller: Seller } | { kind: 'failed'; reason: string };
@@ -53,22 +41,8 @@ export type StoreHttpResult = { kind: 'seller'; seller: Seller } | { kind: 'fail
  * HTTP path rather than returning part of a seller: the caller then loads the store in a tab, which
  * handles challenges, not-found stores and slow pages.
  */
-export async function scrapeStoreOverHttp(
-    storeUrl: string,
-    identity: HttpIdentity,
-    log: Log,
-): Promise<StoreHttpResult> {
+export async function scrapeStoreOverHttp(storeUrl: string, client: HttpClient, log: Log): Promise<StoreHttpResult> {
     const startedAt = Date.now();
-    const client = new Impit({
-        browser: 'chrome',
-        proxyUrl: identity.proxyUrl,
-        timeout: HTTP_TIMEOUT_MS,
-        headers: {
-            'user-agent': identity.userAgent,
-            'accept-language': 'en-US,en;q=0.9',
-            cookie: identity.cookieHeader,
-        },
-    });
     try {
         const store = await getPage(client, storeUrl);
         const $ = load(store.html);
@@ -86,8 +60,7 @@ export async function scrapeStoreOverHttp(
         const aboutUrl = aboutHref ? stripUrlParams(new URL(aboutHref, store.url).href) : null;
         if (!reviewUrl) return { kind: 'failed', reason: 'no Review link on the store page' };
 
-        // About Us and the Review page do not depend on each other; the review filters do (the
-        // store keeps the active filter in the session), so those go one after the other.
+        // About Us and the Review page do not depend on each other; the review filters need the Review page's form.
         const [about, review] = await Promise.all([
             aboutUrl ? getPage(client, aboutUrl).then((page) => readAbout(load(page.html))) : Promise.resolve(null),
             getPage(client, reviewUrl),
@@ -126,29 +99,14 @@ export async function scrapeStoreOverHttp(
         });
         return { kind: 'seller', seller };
     } catch (error) {
-        return { kind: 'failed', reason: describeError(error) };
+        return { kind: 'failed', reason: describeHttpError(error) };
     }
-}
-
-/**
- * One line for the log. impit puts the cause after a generic first line ("The internal HTTP library
- * has thrown an error:"), in a multi-line Rust debug dump, so the first line alone says nothing.
- */
-function describeError(error: unknown): string {
-    return ((error as Error).message ?? String(error)).replace(/\s+/g, ' ').trim().slice(0, 300);
 }
 
 /** GET a page; throws on a refusal or a challenge, so the caller falls back to the browser. */
-async function getPage(client: Impit, url: string): Promise<{ url: string; html: string }> {
-    // A request the proxy drops (impit throws: connect / tunnel / read errors) is asked once more
-    // before the whole HTTP path gives up for a browser tab, which costs far more. A refusal or a
-    // challenge is an answer, not a dropped request: it is not retried here.
-    let response: Awaited<ReturnType<Impit['fetch']>>;
-    try {
-        response = await client.fetch(url);
-    } catch {
-        response = await client.fetch(url);
-    }
+async function getPage(client: HttpClient, url: string): Promise<{ url: string; html: string }> {
+    // A request the proxy drops is already sent once more by the client (see `createHttpClient`).
+    const response = await client.fetch(url);
     const html = await response.text();
     if (response.status >= 400) throw new Error(`HTTP ${response.status} for ${url}`);
     if (/<title>[^<]*(access denied|just a moment|attention required)/i.test(html) || html.includes('_cf_chl_opt')) {
@@ -287,12 +245,13 @@ function readReviewCards($: CheerioAPI): RawReviewCard[] {
 
 /**
  * The three review filters, from the URLs the page's `SellerscoreActionForm` (a GET form) would load:
- * its fields as the browser would submit them, with `score` set to the filter. One after the other —
- * the store keeps the filter in the session — and each checked by the `#score` it came back with,
- * asked once more when it is another (seen: Positive answered as "All"). Returns why on failure.
+ * its fields as the browser would submit them, with `score` set to the filter. All three at once: the
+ * client keeps no cookie jar, so no session carries one filter over to the next. Each is still checked
+ * by the `#score` it came back with, and asked once more when it is another (seen: Positive answered
+ * as "All"). Returns why on failure.
  */
 async function readReviewBuckets(
-    client: Impit,
+    client: HttpClient,
     $review: CheerioAPI,
     reviewUrl: string,
 ): Promise<Record<'positive' | 'neutral' | 'negative', ReturnType<typeof reviewSamplesFromCards>> | string> {
@@ -311,24 +270,29 @@ async function readReviewBuckets(
         })
         .map((el) => [$review(el).attr('name') ?? '', $review(el).val()?.toString() ?? '']);
 
+    const filtered = await Promise.all(
+        REVIEW_TYPES.map(async ({ type, status }) => {
+            const query = new URLSearchParams(
+                fields.map(([name, value]) => {
+                    if (name === 'score') return [name, status];
+                    if (name === 'page') return [name, '1'];
+                    return [name, value];
+                }),
+            );
+            let cards: RawReviewCard[] | null = null;
+            for (let attempt = 0; attempt < 2 && !cards; attempt++) {
+                const page = await getPage(client, `${action}?${query.toString()}`);
+                const $ = load(page.html);
+                if ($('#score').first().val()?.toString() === status) cards = readReviewCards($);
+            }
+            return { type, cards };
+        }),
+    );
     const result = { positive: [], neutral: [], negative: [] } as Record<
         'positive' | 'neutral' | 'negative',
         ReturnType<typeof reviewSamplesFromCards>
     >;
-    for (const { type, status } of REVIEW_TYPES) {
-        const query = new URLSearchParams(
-            fields.map(([name, value]) => {
-                if (name === 'score') return [name, status];
-                if (name === 'page') return [name, '1'];
-                return [name, value];
-            }),
-        );
-        let cards: RawReviewCard[] | null = null;
-        for (let attempt = 0; attempt < 2 && !cards; attempt++) {
-            const page = await getPage(client, `${action}?${query.toString()}`);
-            const $ = load(page.html);
-            if ($('#score').first().val()?.toString() === status) cards = readReviewCards($);
-        }
+    for (const { type, cards } of filtered) {
         if (!cards) return `the ${type} review filter did not apply`;
         result[type] = reviewSamplesFromCards(cards);
     }
