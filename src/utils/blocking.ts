@@ -29,10 +29,24 @@ const BLOCKED_URL_PATTERNS = [
     '.webm',
     '.m3u8',
     '.mp3',
+    // DHGate's SVG icons (header, footer, service badges). `*` matches anything in between.
+    'dhresource.com*.svg',
     // Fonts.
     '.woff',
     '.ttf',
     '.otf',
+    'fonts.googleapis.com',
+    'fonts.gstatic.com',
+    // DHGate's own telemetry: error reports, page-performance beacons, click / view tracking. Not its
+    // data APIs (`dg.`, `leo.`, `mrd.`, `www.dhgate.com` XHRs), even the ones nothing here reads: the
+    // Next.js app crashes when one of those fails (an `onSuccess` handed `undefined` was seen doing it).
+    'sentry.dhgate.com',
+    'go-mpulse.net',
+    'd1.dhgate.com/track',
+    'sgtm.dhgate.com',
+    // The Google Translate widget on store pages (~100 KB of script).
+    'translate.google',
+    'translate-pa.googleapis.com',
     // Third-party trackers and ads.
     'google-analytics.com',
     'googletagmanager.com',
@@ -51,6 +65,18 @@ const BLOCKED_URL_PATTERNS = [
     'snapchat.com',
     'taboola.com',
     'outbrain.com',
+    'amazon-adsystem.com',
+    'redditstatic.com',
+    'reddit.com/rp',
+    'trmit.com',
+    'creativecdn.com',
+    'upsellit.com',
+    'axvdata.com',
+    'bxtag.com',
+    'matycube.net',
+    'applovin.com',
+    'pxaction.com',
+    'altopd.com',
 ];
 
 /** Block {@link BLOCKED_URL_PATTERNS} on `page`. Call before its first navigation. */

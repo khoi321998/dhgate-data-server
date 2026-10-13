@@ -89,6 +89,7 @@ docker run -d --name dhgate-server -p 8080:8080 --init --shm-size=1g --env-file 
 | `MAX_REQUEST_RETRIES` | `3` | Retries per page after the first attempt, each on a new session / proxy IP |
 | `JOB_TIMEOUT_SECS` | `900` | A request with no result after this long gets `502` |
 | `PARALLEL_SELLER` | `true` | `product_and_seller`: open the store page in a second tab as soon as the product page has loaded, instead of after the product is scraped. `false` = one after the other |
+| `DEBUG_PAGE_ERRORS` | `false` | Diagnosis only: record each page's JavaScript errors, failed requests and URL changes, and log them (`[crash debug]`) when DHGate's page crashes into "Application error". Injects a script into the page, which bot detection can notice — keep it off in production |
 | `APIFY_PROXY_PASSWORD` | | Required when `APIFY_PROXY_GROUPS` is set; the server refuses to start without it |
 | `APIFY_PROXY_GROUPS` | empty | Apify proxy: empty = none (this machine's own IP, many more Cloudflare challenges), `DATACENTER` or `RESIDENTIAL` (the exit that measured best on DHGate). Anything else stops the server at startup |
 | `APIFY_PROXY_COUNTRY` | `US` | Two-letter exit country. Empty = any country |

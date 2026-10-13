@@ -1,7 +1,7 @@
 import type { Page } from 'playwright';
 
 import type { Description } from '../../dto/index.js';
-import { scrollUntilAttached } from '../../utils/scroll.js';
+import { SCROLL_TIMEOUT_MILLIS, scrollUntilAttached } from '../../utils/scroll.js';
 
 /**
  * Extract the product description as both raw HTML and plain text.
@@ -24,7 +24,7 @@ export async function extractDescription(page: Page): Promise<Description> {
     // The description mounts lazily low on the page — scroll down to it, a step at a time (see
     // `scrollUntilAttached`), so React renders it.
     const toggle = page.locator('[spm-c="seeall_discription"], [spm-c="seeless_discription"]').first();
-    if (!(await scrollUntilAttached(page, toggle, 10_000))) return empty;
+    if (!(await scrollUntilAttached(page, toggle, SCROLL_TIMEOUT_MILLIS))) return empty;
 
     const result = await page.evaluate(() => {
         const tog = document.querySelector('[spm-c="seeall_discription"], [spm-c="seeless_discription"]');

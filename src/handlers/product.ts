@@ -19,6 +19,7 @@ import { mergeSellerPart } from '../merge.js';
 import { pushItem } from '../push.js';
 import { blockUnneededRequests } from '../utils/blocking.js';
 import { effectiveStatus, settleCloudflareChallenge } from '../utils/cloudflare.js';
+import { DEBUG_PAGE_ERRORS, readPageErrors } from '../utils/debug.js';
 import { emptyProduct, emptyResponse, emptySeller, errorResponse } from '../utils/defaults.js';
 import { extractProductId, normalizeDhgateHost } from '../utils/parse.js';
 import { reportedUrl } from '../utils/request.js';
@@ -86,67 +87,72 @@ export async function handleProduct(ctx: PlaywrightCrawlingContext, mode: Captur
     // reads to avoid racing them — otherwise the price read can pick up the wrong value.
     // Each extractor logs its own line as soon as it resolves, so a tester can watch
     // the run and see exactly what each piece of the Product DTO collected.
-    const [title, pricing, specifications, headline, availableQuantity, reviews, deliveryTimeText] = await Promise.all([
-        extractTitle(page).then((r) => {
-            log.info(`[product] title: ${r ?? '(none)'}`);
-            return r;
-        }),
-        extractPricing(page).then((r) => {
-            log.info('[product] pricing', {
-                currency: r.currency,
-                priceMin: r.priceMin,
-                priceMax: r.priceMax,
-            });
-            return r;
-        }),
-        extractSpecifications(page).then((r) => {
-            log.info(`[product] specifications: count=${r.length}`);
-            return r;
-        }),
-        extractHeadlineStats(page).then((r) => {
-            log.info('[product] headlineStats', {
-                rating: r.rating,
-                reviewCount: r.reviewCount,
-                soldCount: r.soldCount,
-            });
-            return r;
-        }),
-        extractAvailableQuantity(page).then((r) => {
-            log.info(`[product] availableQuantity: ${r ?? '(none)'}`);
-            return r;
-        }),
-        extractReviews(page, id).then((r) => {
-            log.info('[product] reviews', {
-                reviewSamples: r.reviewSamples.length,
-                ratingBreakdown: r.ratingBreakdown,
-            });
-            return r;
-        }),
-        extractDeliveryTimeText(page).then((r) => {
-            log.info(`[product] deliveryTimeText: ${r ?? '(none)'}`);
-            return r;
-        }),
-    ]);
-    // A crashed app leaves nothing for the steps below but their timeouts — check before them.
-    await retryIfAppCrashed(ctx);
-    const media = await extractMedia(page);
+    // Every read below races the crash watch: a crashed page is retried within a second instead of
+    // after the extractors have waited out their timeouts on it (30 s for the price alone).
+    const crashWatch = watchForAppCrash(ctx);
+    const [title, pricing, specifications, headline, availableQuantity, reviews, deliveryTimeText] =
+        await crashWatch.race(
+            Promise.all([
+                extractTitle(page).then((r) => {
+                    log.info(`[product] title: ${r ?? '(none)'}`);
+                    return r;
+                }),
+                extractPricing(page).then((r) => {
+                    log.info('[product] pricing', {
+                        currency: r.currency,
+                        priceMin: r.priceMin,
+                        priceMax: r.priceMax,
+                    });
+                    return r;
+                }),
+                extractSpecifications(page).then((r) => {
+                    log.info(`[product] specifications: count=${r.length}`);
+                    return r;
+                }),
+                extractHeadlineStats(page).then((r) => {
+                    log.info('[product] headlineStats', {
+                        rating: r.rating,
+                        reviewCount: r.reviewCount,
+                        soldCount: r.soldCount,
+                    });
+                    return r;
+                }),
+                extractAvailableQuantity(page).then((r) => {
+                    log.info(`[product] availableQuantity: ${r ?? '(none)'}`);
+                    return r;
+                }),
+                extractReviews(page, id).then((r) => {
+                    log.info('[product] reviews', {
+                        reviewSamples: r.reviewSamples.length,
+                        ratingBreakdown: r.ratingBreakdown,
+                    });
+                    return r;
+                }),
+                extractDeliveryTimeText(page).then((r) => {
+                    log.info(`[product] deliveryTimeText: ${r ?? '(none)'}`);
+                    return r;
+                }),
+            ]),
+        );
+    const media = await crashWatch.race(extractMedia(page));
     log.info('[product] media', { images: media.images.length, videos: media.videos.length });
 
     // An API call from the page, not the "Buyer Protection" modal: no DOM side effect.
-    const paymentMethods = await extractPaymentMethods(page);
+    const paymentMethods = await crashWatch.race(extractPaymentMethods(page));
     log.info(`[product] paymentMethods: ${paymentMethods.join(', ') || '(none)'}`);
 
-    // Runs after the price/title reads: scrolls to the bottom to mount the lazy
-    // description block (same DOM side effect as extractSellerInline below).
-    const description = await extractDescription(page);
+    // Runs after the price/title reads: scrolls down to mount the lazy description block
+    // (same DOM side effect as extractSellerInline below).
+    const description = await crashWatch.race(extractDescription(page));
     log.info('[product] description', {
         plainTextChars: description.plainText.length,
         htmlChars: description.html.length,
     });
 
-    // Runs last: it scrolls to the bottom of the page (a DOM side effect), so it must
-    // not race the price/title reads above. Only needed when we also want the seller.
-    const sellerInline = wantSeller ? await extractSellerInline(page) : null;
+    // Runs last: it scrolls down the page (a DOM side effect), so it must not race the
+    // price/title reads above. Only needed when we also want the seller.
+    const sellerInline = wantSeller ? await crashWatch.race(extractSellerInline(page)) : null;
+    crashWatch.stop();
     if (sellerInline) {
         log.info('[product] sellerInline', {
             sellerId: sellerInline.ref.platformSellerId,
@@ -156,7 +162,6 @@ export async function handleProduct(ctx: PlaywrightCrawlingContext, mode: Captur
         });
     }
 
-    await retryIfAppCrashed(ctx);
     const product = emptyProduct();
     product.id = id;
     product.title = title ?? '';
@@ -282,23 +287,63 @@ async function scrapeStoreInTab(
 }
 
 /**
- * DHGate's product page is a Next.js app. When a script it needs fails to load — seen through the
- * proxy as `ERR_TUNNEL_CONNECTION_FAILED` / `429` on its resources under load — React throws while
- * rendering and Next replaces the whole page with "Application error: a client-side exception has
- * occurred". Nothing on that page is the product, so the attempt is retried in a new browser on a new
- * session. Once retries run out, the fields read before the crash are kept rather than thrown away.
+ * DHGate's product page is a Next.js app, and it sometimes crashes into "Application error: a
+ * client-side exception has occurred" — seen after a `ChunkLoadError` and after an API call that came
+ * back empty (`ERR_TUNNEL_CONNECTION_FAILED` / `429` through the proxy), but also without a proxy and
+ * with no cause in reach: Patchright keeps the page's console closed. Nothing on that page is the
+ * product, so the attempt is retried in a new browser on a new session (see `watchForAppCrash`).
  */
 const APP_CRASHED = `DHGate's page crashed in the browser (Next.js "Application error")`;
 
-async function retryIfAppCrashed({ page, request, log }: PlaywrightCrawlingContext): Promise<void> {
-    const crashed = await page
-        .evaluate(() => /Application error: a client-side exception/i.test(document.body?.innerText ?? ''))
-        .catch(() => false);
-    if (!crashed) return;
-    if (request.retryCount < MAX_REQUEST_RETRIES) {
-        throw new Error(`${APP_CRASHED} — retrying with a new session`);
-    }
-    log.warning(`[product] ${APP_CRASHED} and retries are spent — keeping what was read before`);
+/** How often the crash watch looks at the page. */
+const CRASH_POLL_MILLIS = 1_000;
+
+/**
+ * Watch the page for Next's crash screen while the extractors run, and make `race(work)` reject
+ * the moment it shows, so the attempt is retried in a new browser on a new session without waiting
+ * for `work`. On the last attempt it never rejects: the fields read before the crash are kept.
+ * `stop()` ends the polling; it also ends on its own once the page is closed.
+ */
+function watchForAppCrash({ page, request, log }: PlaywrightCrawlingContext): {
+    race: <T>(work: Promise<T>) => Promise<T>;
+    stop: () => void;
+} {
+    const retriesLeft = request.retryCount < MAX_REQUEST_RETRIES;
+    let stopped = false;
+    const crashed = new Promise<never>((_resolve, reject) => {
+        void (async () => {
+            while (!stopped && !page.isClosed()) {
+                const isCrashed = await page
+                    .evaluate(() => /Application error: a client-side exception/i.test(document.body?.innerText ?? ''))
+                    .catch(() => false);
+                if (isCrashed && !stopped) {
+                    stopped = true;
+                    // Before the retry closes the page: what it recorded is the only trace of why.
+                    if (DEBUG_PAGE_ERRORS) {
+                        log.warning(`[crash debug] ${APP_CRASHED} at ${page.url()}`);
+                        for (const line of await readPageErrors(page)) log.warning(`[crash debug] ${line}`);
+                    }
+                    if (retriesLeft) {
+                        reject(new Error(`${APP_CRASHED} — retrying with a new session`));
+                    } else {
+                        log.warning(`[product] ${APP_CRASHED} and retries are spent — keeping what was read before`);
+                    }
+                    return;
+                }
+                await new Promise((resolve) => {
+                    setTimeout(resolve, CRASH_POLL_MILLIS);
+                });
+            }
+        })();
+    });
+    // Handled here once, so a crash seen after the last `race` is not an unhandled rejection.
+    crashed.catch(() => undefined);
+    return {
+        race: async <T>(work: Promise<T>) => Promise.race([work, crashed]),
+        stop: () => {
+            stopped = true;
+        },
+    };
 }
 
 /**

@@ -24,6 +24,7 @@ import { createRouter, DEFAULT_MODE, LABELS, modeOf } from './routes.js';
 import { blockUnneededRequests } from './utils/blocking.js';
 import { chooseChrome } from './utils/browser.js';
 import { passCloudflare } from './utils/cloudflare.js';
+import { DEBUG_PAGE_ERRORS, recordPageErrors } from './utils/debug.js';
 import { emptyResponse } from './utils/defaults.js';
 import { DEFAULT_SHIP_COUNTRY, extractDhgateShipCountry, normalizeDhgateHost } from './utils/parse.js';
 import { startQueuedNow } from './utils/pool.js';
@@ -223,6 +224,8 @@ const crawler = new DhgateCrawler(
                 logPageErrors(page, request.label ?? 'page');
                 // Images, video, fonts and trackers never go out through the proxy — see utils/blocking.ts.
                 await blockUnneededRequests(page);
+                // DEBUG_PAGE_ERRORS: record the page's JavaScript errors, logged if it crashes.
+                if (DEBUG_PAGE_ERRORS) await recordPageErrors(page);
             },
         ],
         postNavigationHooks: [
@@ -581,6 +584,7 @@ server.listen(PORT, () => {
         MAX_REQUEST_RETRIES,
         JOB_TIMEOUT_SECS: JOB_TIMEOUT_MS / 1000,
         PARALLEL_SELLER,
+        DEBUG_PAGE_ERRORS,
         APIFY_PROXY: describeProxy(proxyChoice),
         APIFY_PROXY_PASSWORD: process.env.APIFY_PROXY_PASSWORD ? 'set' : 'not set',
         API_KEY: 'set',

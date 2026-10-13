@@ -26,14 +26,13 @@ export async function extractPricing(page: Page): Promise<Pricing> {
         .first();
 
     // The price block renders slightly later than the title, so wait for it.
-    const waitStartedAt = Date.now();
-    await priceLoc.waitFor({ state: 'visible', timeout: PRICE_TIMEOUT_MILLIS }).catch(() => {});
-    // DHGate sometimes rewrites the URL to `?skuId=…&stockCountry=…` right after load. That navigation
-    // ends the wait above early, with the price not found on a document that is going away. Wait for
-    // the new one and look once more — only then: a wait that ran its full course found nothing.
-    if ((await priceLoc.count()) === 0 && Date.now() - waitStartedAt < PRICE_TIMEOUT_MILLIS) {
-        await page.waitForLoadState('domcontentloaded').catch(() => {});
-        await priceLoc.waitFor({ state: 'visible', timeout: PRICE_TIMEOUT_MILLIS }).catch(() => {});
+    // DHGate rewrites the URL to `?skuId=…` (and `&stockCountry=…`) right after load — sometimes
+    // twice — and each rewrite can end a wait early, with the price not yet rendered. So the wait is
+    // picked up again after every early end, until the price shows or the budget is spent.
+    const deadline = Date.now() + PRICE_TIMEOUT_MILLIS;
+    while ((await priceLoc.count()) === 0 && Date.now() < deadline) {
+        await priceLoc.waitFor({ state: 'visible', timeout: Math.max(1, deadline - Date.now()) }).catch(() => {});
+        if ((await priceLoc.count()) === 0) await page.waitForTimeout(250).catch(() => {});
     }
     if ((await priceLoc.count()) === 0) return pricing;
 

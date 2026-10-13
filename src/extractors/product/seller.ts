@@ -2,7 +2,7 @@ import type { Page } from 'playwright';
 
 import type { SellerRef } from '../../dto/index.js';
 import { extractSellerId, normalizeImageUrl, parseAmount,stripUrlParams } from '../../utils/parse.js';
-import { scrollUntilAttached } from '../../utils/scroll.js';
+import { SCROLL_TIMEOUT_MILLIS, scrollUntilAttached } from '../../utils/scroll.js';
 
 /** Seller data read inline from the PDP's "About the Store" block (no navigation). */
 export interface SellerInline {
@@ -33,7 +33,7 @@ export async function extractSellerInline(page: Page): Promise<SellerInline | nu
     // sitting in a sibling block. The has-filter also keeps the scroll going until
     // the lazily-mounted store link is present.
     const block = page.locator('[spm-c="soldby"]', { has: page.locator('a[spm-index="store"]') }).first();
-    if (!(await scrollUntilAttached(page, block, 10_000))) return null;
+    if (!(await scrollUntilAttached(page, block, SCROLL_TIMEOUT_MILLIS))) return null;
 
     const storeLink = block.locator('a[spm-index="store"]').first();
     if ((await storeLink.count()) === 0) return null;
