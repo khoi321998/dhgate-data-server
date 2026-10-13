@@ -12,7 +12,7 @@ import { settleCloudflareChallenge } from '../../utils/cloudflare.js';
 import { stripUrlParams, parseCompactNumber, parseAmount } from '../../utils/parse.js';
 
 /** Cap on how many seller reviews we keep per review type. */
-const MAX_REVIEWS_PER_TYPE = 5;
+export const MAX_REVIEWS_PER_TYPE = 5;
 
 /** Budget for each filtered review page fetched by {@link fetchReviewBuckets}. */
 const REVIEW_FETCH_TIMEOUT_MS = 15_000;
@@ -22,7 +22,7 @@ const REVIEW_FETCH_TIMEOUT_MS = 15_000;
  * ("All" is `-2`; we skip it — the three buckets below already cover the list, and an
  * unfiltered sample is dominated by positives.)
  */
-const REVIEW_TYPES: { type: SellerReviewType; status: string }[] = [
+export const REVIEW_TYPES: { type: SellerReviewType; status: string }[] = [
     { type: 'positive', status: '1' },
     { type: 'neutral', status: '0' },
     { type: 'negative', status: '-1' },
@@ -179,7 +179,7 @@ async function extractServiceScore(page: Page): Promise<SellerServiceScore | nul
 }
 
 /** Pull the industry out of "(Mainly Industry : Pet Supplies)" -> "Pet Supplies". */
-function parseIndustry(text: string): string | null {
+export function parseIndustry(text: string): string | null {
     if (!text) return null;
     const match = text.match(/industry\s*:\s*([^)]+)/i);
     return match ? match[1].trim() : null;
@@ -221,19 +221,35 @@ async function extractReviewSamples(page: Page): Promise<SellerReviewSamples> {
 
 type ReviewBucket = { samples: SellerReviewSample[] } | { error: string };
 
+/** One review card's raw strings, as read off a review page (in the browser or from fetched HTML). */
+export interface RawReviewCard {
+    user: string;
+    country: string;
+    ratingStyle: string | null;
+    reviewDate: string;
+    comment: string;
+    helpful: string;
+    unhelpful: string;
+}
+
 /** One filter's cards as read in the page — raw strings, parsed afterwards like `extractReviews` parses its cards. */
 interface RawBucket {
     status: string;
     error?: string;
-    cards?: {
-        user: string;
-        country: string;
-        ratingStyle: string | null;
-        reviewDate: string;
-        comment: string;
-        helpful: string;
-        unhelpful: string;
-    }[];
+    cards?: RawReviewCard[];
+}
+
+/** Turn review cards into samples, parsed as `extractReviews` parses the cards on the page. */
+export function reviewSamplesFromCards(cards: RawReviewCard[]): SellerReviewSample[] {
+    return cards.map((card) => ({
+        user: card.user.replace(/^By:\s*/i, '') || null,
+        country: card.country || null,
+        rating: ratingFromWidth(card.ratingStyle),
+        reviewDate: card.reviewDate || null,
+        comment: card.comment || null,
+        helpfulCount: parseCompactNumber(card.helpful),
+        unhelpfulCount: parseUnhelpful(card.unhelpful),
+    }));
 }
 
 /**
@@ -337,18 +353,7 @@ async function fetchReviewBuckets(page: Page, statuses: string[]): Promise<Map<s
             }
             continue;
         }
-        // Parsed as the page switch parsed its cards (see `extractReviews`).
-        buckets.set(result.status, {
-            samples: cards.map((card) => ({
-                user: card.user.replace(/^By:\s*/i, '') || null,
-                country: card.country || null,
-                rating: ratingFromWidth(card.ratingStyle),
-                reviewDate: card.reviewDate || null,
-                comment: card.comment || null,
-                helpfulCount: parseCompactNumber(card.helpful),
-                unhelpfulCount: parseUnhelpful(card.unhelpful),
-            })),
-        });
+        buckets.set(result.status, { samples: reviewSamplesFromCards(cards) });
     }
     return buckets;
 }
@@ -436,7 +441,7 @@ function ratingFromWidth(style: string | null): number | null {
 }
 
 /** Pull the count out of "unhelpful ( 0 )". */
-function parseUnhelpful(text: string): number | null {
+export function parseUnhelpful(text: string): number | null {
     const match = text.match(/unhelpful\s*\(\s*([\d.,]+)/i);
     return match ? parseCompactNumber(match[1]) : null;
 }

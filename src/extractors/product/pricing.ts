@@ -36,10 +36,18 @@ export async function extractPricing(page: Page): Promise<Pricing> {
     }
     if ((await priceLoc.count()) === 0) return pricing;
 
-    const currentText = (await priceLoc.textContent())?.trim() ?? null;
+    // The element can be caught mid re-render (the same URL rewrites), its text momentarily without
+    // the amount: read again until it carries one, within the same budget.
+    let currentText: string | null = null;
+    let amounts: number[] = [];
+    for (;;) {
+        currentText = (await priceLoc.textContent({ timeout: 5_000 }).catch(() => null))?.trim() ?? null;
+        amounts = parseAmounts(currentText);
+        if (amounts.length > 0 || Date.now() >= deadline) break;
+        await page.waitForTimeout(250).catch(() => {});
+    }
 
     // Current price may be a single value or a range ("US $14.9 - 20.0").
-    const amounts = parseAmounts(currentText);
     if (amounts.length > 0) {
         pricing.priceMin = amounts[0];
         pricing.priceMax = amounts[amounts.length - 1];

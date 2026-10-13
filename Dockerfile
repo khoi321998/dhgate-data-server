@@ -34,11 +34,12 @@ RUN npm ls @crawlee/core apify puppeteer playwright
 # to speed up the build using Docker layer cache.
 COPY --chown=myuser:myuser package*.json ./
 
-# Install NPM packages, skip optional and development dependencies to
-# keep the image small. Avoid logging too much and print the dependency
-# tree for debugging
+# Install NPM packages, skip development dependencies to keep the image small. Optional dependencies
+# are kept: impit ships its native binary as one (impit-linux-x64-gnu); without it every store page
+# would fall back from HTTP to a browser tab. Avoid logging too much and print the dependency tree
+# for debugging
 RUN npm --quiet set progress=false \
-    && npm install --omit=dev --omit=optional \
+    && npm install --omit=dev \
     && echo "Installed NPM packages:" \
     && (npm list --omit=dev --all || true) \
     && echo "Node.js version:" \

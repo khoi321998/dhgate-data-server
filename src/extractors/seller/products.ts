@@ -7,7 +7,7 @@ import { parseAmount, parseCompactNumber, stripUrlParams, normalizeImageUrl } fr
  * The bar is `<span class="rating"><span style="width:90%;"></span></span>`,
  * where 100% == 5 stars, so `rating = percent / 20` (e.g. 90% -> 4.5).
  */
-function ratingFromWidth(style: string | null): number | null {
+export function ratingFromWidth(style: string | null): number | null {
     if (!style) return null;
     const match = style.match(/width:\s*([\d.]+)%/i);
     if (!match) return null;
@@ -16,7 +16,7 @@ function ratingFromWidth(style: string | null): number | null {
 }
 
 /** Compute a positive discount percentage from list/original prices, or null if either is missing. */
-function discountPercent(price: number | null, originalPrice: number | null): number | null {
+export function discountPercent(price: number | null, originalPrice: number | null): number | null {
     if (price == null || originalPrice == null || originalPrice <= 0 || price >= originalPrice) return null;
     return Math.round(((originalPrice - price) / originalPrice) * 100);
 }
@@ -35,7 +35,7 @@ function discountPercent(price: number | null, originalPrice: number | null): nu
  * - `.pro-rating .rating > span` (fill width) + `.pro-rating .num` -> rating + review count
  */
 /** Cap on how many product previews we keep per seller. */
-const MAX_PREVIEWS = 10;
+export const MAX_PREVIEWS = 10;
 
 export async function extractSellerProducts(page: Page): Promise<SellerProductPreview[]> {
     // The `#proGallery .gitem` strip only exists on the store's Top-Selling tab — NOT on
@@ -78,6 +78,24 @@ export async function extractSellerProducts(page: Page): Promise<SellerProductPr
         })),
     );
 
+    return previewsFromCards(cards);
+}
+
+/** One gallery card's raw strings, as read off a store page (in the browser or from fetched HTML). */
+export interface RawPreviewCard {
+    itemcode: string | null;
+    href: string | null;
+    imageSrc: string | null;
+    titleAttr: string | null;
+    titleText: string;
+    priceText: string;
+    originalPriceText: string;
+    ratingStyle: string | null;
+    reviewText: string;
+}
+
+/** Turn gallery cards into previews: the first {@link MAX_PREVIEWS} with a product reference. */
+export function previewsFromCards(cards: RawPreviewCard[]): SellerProductPreview[] {
     const previews: SellerProductPreview[] = [];
     for (const card of cards) {
         // Keep at most MAX_PREVIEWS.
@@ -118,7 +136,7 @@ export async function extractSellerProducts(page: Page): Promise<SellerProductPr
 }
 
 /** Return a copy of `obj` with all null/undefined-valued keys removed. */
-function compact(obj: Record<string, unknown>): SellerProductPreview {
+export function compact(obj: Record<string, unknown>): SellerProductPreview {
     const out: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(obj)) {
         if (value !== null && value !== undefined) out[key] = value;

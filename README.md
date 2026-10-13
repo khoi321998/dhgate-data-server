@@ -48,7 +48,7 @@ Response `200`:
 
 - The body is the same row the Apify Actor pushed to its dataset (see [src/dto/response.ts](src/dto/response.ts)), plus `status` and `timing`.
 - A `200` can still have `success: false`: `errorCode` is `ITEM_NOT_FOUND` / `SELLER_NOT_FOUND` when the listing or store is gone, or `FETCH_FAILED` when the product was scraped but the seller page never loaded (the product is kept).
-- `product_and_seller` reads the store link from the store header at the top of the product page and opens the store page in a second tab of the request's browser while the product is being scraped (and the store's About Us page in a third), so the request takes about as long as the slower of the two pages. If the store page is blocked or fails, the whole request is retried in a new browser; once retries run out the product is kept and the row reports `FETCH_FAILED` for the seller. The two rows are merged with the same precedence as before (identity from the product page, stats / previews / about / reviews from the store page).
+- `product_and_seller` reads the store link from the store header at the top of the product page and scrapes the store — top-selling page, About Us, the Review page and its three filters — while the product is being scraped. It does so over plain HTTP (impit, as the request's browser: its proxy, user agent and cookies), and only opens the pages in tabs of the request's browser when HTTP fails (`STORE_OVER_HTTP`). The request takes about as long as the product page. If the store cannot be scraped either way, the whole request is retried in a new browser; once retries run out the product is kept and the row reports `FETCH_FAILED` for the seller. The two rows are merged with the same precedence as before (identity from the product page, stats / previews / about / reviews from the store page).
 - `extraction.status` other than `ok` usually means a DHGate markup change broke a selector.
 - `timing.queueMs` is the time before the crawler picked the request up. `processMs` is the scrape itself, including retries.
 - Every error response has the same body: `{ "status": "failed", "url", "error", "statusCode", "timing" }`. `url` is `null` when the request had no valid url. `statusCode` is the HTTP status of the last failed navigation, or `null`; `timing` is all zeros when no scrape ran.
@@ -88,7 +88,9 @@ docker run -d --name dhgate-server -p 8080:8080 --init --shm-size=1g --env-file 
 | `MAX_QUEUE` | `100` | Max requests running or waiting. Beyond this, requests get `503` |
 | `MAX_REQUEST_RETRIES` | `3` | Retries per page after the first attempt, each on a new session / proxy IP |
 | `JOB_TIMEOUT_SECS` | `900` | A request with no result after this long gets `502` |
-| `PARALLEL_SELLER` | `true` | `product_and_seller`: open the store page in a second tab as soon as the product page has loaded, instead of after the product is scraped. `false` = one after the other |
+| `PARALLEL_SELLER` | `true` | `product_and_seller`: start scraping the store as soon as the product page has loaded, instead of after the product is scraped. `false` = one after the other |
+| `CRASH_GUARD` | `true` | Give the product page an empty init script. DHGate's Next.js page crashes into "Application error" on ~1 in 6 attempts without it, and did not crash once with it (40 vs 40 requests, interleaved). The crash is then retried, so turning this off costs time, not data. An injected script is a trace bot detection can look for — the reason it can be turned off |
+| `STORE_OVER_HTTP` | `true` | Scrape the store, About and Review pages over plain HTTP (impit, Chrome's TLS fingerprint) as the request's browser — its proxy, user agent and cookies — instead of in browser tabs; a tab is opened only when HTTP fails. `false` = always tabs |
 | `DEBUG_PAGE_ERRORS` | `false` | Diagnosis only: record each page's JavaScript errors, failed requests and URL changes, and log them (`[crash debug]`) when DHGate's page crashes into "Application error". Injects a script into the page, which bot detection can notice — keep it off in production |
 | `APIFY_PROXY_PASSWORD` | | Required when `APIFY_PROXY_GROUPS` is set; the server refuses to start without it |
 | `APIFY_PROXY_GROUPS` | empty | Apify proxy: empty = none (this machine's own IP, many more Cloudflare challenges), `DATACENTER` or `RESIDENTIAL` (the exit that measured best on DHGate). Anything else stops the server at startup |
@@ -99,11 +101,58 @@ The server logs its effective configuration at startup. Secrets are shown only a
 
 ## Timeouts for callers
 
-A product page takes ~10 s, `product_and_seller` ~30 s. A blocked page is retried `MAX_REQUEST_RETRIES` times with a 5 s pause and a Cloudflare wait each, so a worst-case request takes several minutes. Set the caller's HTTP timeout above that (or above `JOB_TIMEOUT_SECS`).
+Measured over 20 sequential `product_and_seller` requests each (October 2026): ~7–9 s without a proxy, ~13–17 s (up to ~28 s) through Apify's residential US proxy. A blocked or crashed page is retried `MAX_REQUEST_RETRIES` times with a 5 s pause and a Cloudflare wait each, so a worst-case request takes several minutes. Set the caller's HTTP timeout above that (or above `JOB_TIMEOUT_SECS`).
 
 ## Logs
 
 Every line of a request starts with its url and `transactionId`, so one request can be found with `docker logs dhgate-server 2>&1 | grep order-1234`. The lines are `Received ...`, the crawl steps (`... | [product] title: ...`, `... | [seller] header ...`, Cloudflare and retry lines), and then `Scraped ...` or `Scrape failed for ...`. A full queue logs `Rejected ...: server busy`.
+
+## Troubleshooting
+
+What has gone wrong so far, how it shows in the logs, and what to try. Grep one request's lines with its `transactionId`.
+
+### Blocked by Akamai or Cloudflare — check our injected scripts first
+
+DHGate is behind Akamai (cookies `ak_bmsc`, `bm_sz`, `_abck`) and Cloudflare (`__cf_bm`). **We inject a script into the product page**, and an injected script is exactly the kind of trace bot detection looks for:
+
+- `CRASH_GUARD` (on by default) adds an empty init script — it is what keeps DHGate's page from crashing (see below);
+- `DEBUG_PAGE_ERRORS=true` adds an error recorder, also an init script.
+
+Patchright puts an init script in by routing the page's document through itself. None of this has been flagged so far (~140 requests with a script, direct and through the residential proxy, no challenge), but if blocks start, suspect it first.
+
+| Signs | Try |
+| --- | --- |
+| `Cloudflare challenge … still up … going for the checkbox`, `Clicking the Cloudflare checkbox`, retries `Cloudflare is still holding us on its challenge page` | 1. Make sure `DEBUG_PAGE_ERRORS` is off. 2. Set `CRASH_GUARD=false` and compare the block rate. The crashes come back (~1 in 6 attempts), but they are retried, so that costs time, not data |
+| `DHGate answered HTTP 403`, `DHGate served its "Access Denied" page` (Akamai) | Same as above, then look at the IP: with no proxy or `DATACENTER`, every request and every retry comes from one IP; switch to `RESIDENTIAL`. Lower `MAX_CONCURRENCY` if it happens under load |
+| `[seller] store over HTTP gave up (refused or challenged at …)` | The store pages' HTTP client (impit) is being refused. Store data still comes through a browser tab; set `STORE_OVER_HTTP=false` to stop trying HTTP |
+
+### DHGate's page crashes: "Application error: a client-side exception has occurred"
+
+Log: `Attempt N failed … DHGate's page crashed in the browser (Next.js "Application error")`. DHGate's Next.js product page dies a few seconds after load (just before it: `specifications: count=0`, `deliveryTimeText: (none)`). It happens with and without a proxy: ~17% of attempts in a 40-request run without `CRASH_GUARD`, 0 with it (40 requests, interleaved). The JavaScript error itself was never captured — Patchright keeps the page's console closed, and the recorder that would show it (`DEBUG_PAGE_ERRORS`) is an init script, so it stops the crashes too.
+
+- Check `"CRASH_GUARD":true` in the `Server config` line at startup.
+- A crash is caught within ~1 s and the request retried in a new browser, so the row is still complete.
+
+### Store pages always fall back to a tab
+
+Log on every `product_and_seller` request: `[seller] store over HTTP failed (…)`.
+
+- **In Docker:** impit's native binary is an optional dependency (`impit-linux-x64-gnu`). The Dockerfile must not run `npm install --omit=optional`, or impit throws `Cannot find native binding` and every store page goes to a tab — slower, two more tabs per request, and through the proxy the tabs can stall.
+- Do not replace impit with `fetch` / axios: Akamai fingerprints the TLS / HTTP2 handshake and answers Node's client with 403 "Access Denied" on every DHGate page (curl and Postman get through; so does impit, which impersonates Chrome).
+
+### Fields missing more often through the residential proxy
+
+The residential exit drops some requests (`console error … ERR_TUNNEL_CONNECTION_FAILED`, `429`). Seen: `paymentMethods` empty (`[paymentMethods] no payment logos — Failed to fetch`), now and then `deliveryTimeText`. Without a proxy these did not occur. Compare `RESIDENTIAL`, `DATACENTER` and no proxy before changing code.
+
+### Review samples: `switching the filter on the page instead`
+
+The Review page's filters (Positive / Neutral / Negative) are fetched one after the other, because DHGate keeps the active filter in the session: requested in parallel, they came back with each other's filter. Each response is checked against the filter asked for and asked once more; this line means it still did not apply, and the slow path (switching the filter on the page) took over. Occasional is fine.
+
+### Development pitfalls
+
+- **`npm run start:prod` runs `dist/`**: run `npm run build` after every change, or you are testing the old code.
+- **`__name is not defined` from `page.evaluate`**: under `tsx` (`start:dev`), esbuild wraps named functions in `__name(...)`, which the page does not have. Write page functions without named inner functions (see `extractors/seller/products.ts`). The `tsc` build is not affected. `utils/cloudflare.ts` still has named helpers in its click-position code, so that path fails under `start:dev` only.
+- **The page's console is invisible**: Patchright does not open it. Only `Failed to load resource` lines reach `console error …`; for JavaScript errors use `DEBUG_PAGE_ERRORS=true` (`[crash debug]` lines on a crash).
 
 ## Development
 

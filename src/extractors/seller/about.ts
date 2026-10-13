@@ -4,7 +4,7 @@ import { settleCloudflareChallenge } from '../../utils/cloudflare.js';
 import { stripUrlParams } from '../../utils/parse.js';
 
 /** Map a "Basic Information" row label (lower-cased, colon-stripped) to a SellerAbout key. */
-const LABEL_TO_KEY: Record<string, keyof SellerAbout> = {
+export const LABEL_TO_KEY: Record<string, keyof SellerAbout> = {
     'company name': 'companyName',
     'business type': 'businessType',
     location: 'location',

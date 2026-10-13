@@ -1,7 +1,7 @@
 import type { PlaywrightCrawlingContext } from '@crawlee/playwright';
 import type { Page } from 'playwright';
 
-import { MAX_REQUEST_RETRIES, PARALLEL_SELLER } from '../config.js';
+import { MAX_REQUEST_RETRIES, PARALLEL_SELLER, STORE_OVER_HTTP } from '../config.js';
 import type { CaptureMode, ProductSellerResponse } from '../dto/index.js';
 import { detectBlocked, detectNotFound } from '../extractors/notFound.js';
 import { extractDescription } from '../extractors/product/description.js';
@@ -15,6 +15,7 @@ import { extractDeliveryTimeText } from '../extractors/product/shipping.js';
 import { extractSpecifications } from '../extractors/product/specifications.js';
 import { extractAvailableQuantity } from '../extractors/product/stock.js';
 import { extractTitle } from '../extractors/product/title.js';
+import { scrapeStoreOverHttp } from '../extractors/seller/http.js';
 import { mergeSellerPart } from '../merge.js';
 import { pushItem } from '../push.js';
 import { blockUnneededRequests } from '../utils/blocking.js';
@@ -79,8 +80,9 @@ export async function handleProduct(ctx: PlaywrightCrawlingContext, mode: Captur
     // the server-rendered store header at the top of the PDP, so reading it needs no scroll and does
     // not race the extractors.
     const parallelStoreUrl = wantSeller && PARALLEL_SELLER ? await readStoreUrl(page) : null;
-    if (parallelStoreUrl) log.info(`Opening seller store page in a parallel tab: ${parallelStoreUrl}`);
-    const parallelStore = parallelStoreUrl ? scrapeStoreInTab(ctx, parallelStoreUrl, outUrl, mode) : null;
+    if (parallelStoreUrl)
+        log.info(`Scraping the seller store in parallel (over HTTP, a tab if that fails): ${parallelStoreUrl}`);
+    const parallelStore = parallelStoreUrl ? scrapeStore(ctx, parallelStoreUrl, outUrl, mode) : null;
 
     // Read-only extractors + the reviews API call can run concurrently. extractMedia
     // hovers the gallery (a DOM side effect), so it must run AFTER the price/title
@@ -202,7 +204,7 @@ export async function handleProduct(ctx: PlaywrightCrawlingContext, mode: Captur
     // browser — and the store tab with it. Crawlee closes it after the handler.
     if (parallelStore || (wantSeller && sellerInline?.ref.url)) await releasePage(page);
 
-    // The store page: the parallel tab's result, or — when its link was not in the header — a tab
+    // The store page: the parallel scrape's result, or — when its link was not in the header — a tab
     // opened now from the "About the Store" block's link.
     let store = parallelStore ? await parallelStore : null;
     if (!store && wantSeller && sellerInline?.ref.url) {
@@ -210,7 +212,7 @@ export async function handleProduct(ctx: PlaywrightCrawlingContext, mode: Captur
             sellerId: sellerInline.ref.platformSellerId,
             storeUrl: sellerInline.ref.url,
         });
-        store = await scrapeStoreInTab(ctx, normalizeDhgateHost(sellerInline.ref.url), outUrl, mode);
+        store = await scrapeStore(ctx, normalizeDhgateHost(sellerInline.ref.url), outUrl, mode);
     }
     if (wantSeller && !store) {
         log.warning('product_and_seller mode: no seller store URL found on PDP — pushing product only', { url });
@@ -238,6 +240,36 @@ export async function handleProduct(ctx: PlaywrightCrawlingContext, mode: Captur
     }
 
     await pushItem(ctx, row);
+}
+
+/**
+ * The store page's row: over plain HTTP first (see `scrapeStoreOverHttp`), as this request's browser —
+ * its proxy, user agent and cookies — and in a tab of that browser when HTTP gives up. Never rejects.
+ */
+async function scrapeStore(
+    ctx: PlaywrightCrawlingContext,
+    storeUrl: string,
+    outUrl: string,
+    mode: CaptureMode,
+): Promise<StoreTabOutcome> {
+    if (STORE_OVER_HTTP) {
+        try {
+            const { page, browserController, log } = ctx;
+            const identity = {
+                proxyUrl: browserController.launchContext.proxyUrl ?? undefined,
+                userAgent: await page.evaluate(() => navigator.userAgent),
+                cookieHeader: (await page.context().cookies(storeUrl)).map((c) => `${c.name}=${c.value}`).join('; '),
+            };
+            const result = await scrapeStoreOverHttp(storeUrl, identity, log);
+            if (result.kind === 'seller') return { row: sellerRow(outUrl, mode, result.seller) };
+            log.warning(`[seller] store over HTTP gave up (${result.reason}) — loading it in a tab`);
+        } catch (error) {
+            ctx.log.warning(
+                `[seller] store over HTTP failed (${(error as Error).message.replace(/\s+/g, ' ').slice(0, 300)}) — loading it in a tab`,
+            );
+        }
+    }
+    return scrapeStoreInTab(ctx, storeUrl, outUrl, mode);
 }
 
 /**

@@ -12,7 +12,7 @@ import { Actor } from 'apify';
 import { chromium as patchrightChromium } from 'patchright';
 import type { BrowserType } from 'playwright';
 
-import { intEnv, MAX_REQUEST_RETRIES, PARALLEL_SELLER } from './config.js';
+import { CRASH_GUARD, intEnv, MAX_REQUEST_RETRIES, PARALLEL_SELLER } from './config.js';
 // this is ESM project, and as such, it requires you to specify extensions in your relative imports
 // note that we need to use `.js` even when inside TS files
 import type { CaptureMode, ProductSellerResponse } from './dto/index.js';
@@ -119,7 +119,6 @@ async function withJobLog<T>(request: Request, fn: () => Promise<T>): Promise<T>
  * the navigation hooks, the Cloudflare wait and the route handler — everything that happens on the page.
  */
 class DhgateCrawler extends PlaywrightCrawler {
-     
     protected override async _runRequestHandler(context: PlaywrightCrawlingContext): Promise<void> {
         const { request } = context;
         // The caller already got a timeout response: don't spend a browser page on it.
@@ -204,7 +203,7 @@ const crawler = new DhgateCrawler(
         // Headed, and not negotiable: Playwright's bundled Chromium in headless mode never clears
         // DHGate's Cloudflare challenge — verified against a live product URL, it sat on the
         // interstitial for the full 30s. Headed, the same browser clears it in about five seconds.
-        headless: false,
+        headless: true,
         preNavigationHooks: [
             async ({ page, request }, gotoOptions) => {
                 // Crawlee waits for `load` by default, which DHGate's error pages never fire: a dead
@@ -225,7 +224,10 @@ const crawler = new DhgateCrawler(
                 // Images, video, fonts and trackers never go out through the proxy — see utils/blocking.ts.
                 await blockUnneededRequests(page);
                 // DEBUG_PAGE_ERRORS: record the page's JavaScript errors, logged if it crashes.
+                // (Its recorder is an init script too, so it also does what CRASH_GUARD does.)
                 if (DEBUG_PAGE_ERRORS) await recordPageErrors(page);
+                // CRASH_GUARD: an init script that does nothing keeps DHGate's app from crashing — see config.ts.
+                else if (CRASH_GUARD) await page.addInitScript('void 0;');
             },
         ],
         postNavigationHooks: [
@@ -484,7 +486,10 @@ async function handleScrape(req: IncomingMessage, res: ServerResponse) {
     const described = describeJob({ url, transactionId });
     if (inProgress >= MAX_QUEUE) {
         log.warning(`Rejected ${described}: server busy (${describeLoad()}, MAX_QUEUE=${MAX_QUEUE})`);
-        sendFailed(res, 503, { url, error: `Server busy: ${inProgress} requests in progress (MAX_QUEUE=${MAX_QUEUE}).` });
+        sendFailed(res, 503, {
+            url,
+            error: `Server busy: ${inProgress} requests in progress (MAX_QUEUE=${MAX_QUEUE}).`,
+        });
         return;
     }
 
@@ -511,7 +516,9 @@ async function handleScrape(req: IncomingMessage, res: ServerResponse) {
         const t = timing(job);
         const statusCode = job.statusCode ?? null;
         const message = (error as Error).message.replace(/\s*\n\s*/g, ' ').trim();
-        log.warning(`Scrape failed for ${described} (HTTP ${statusCode ?? 'no response'}) after ${secs(t.totalMs)}: ${message}`);
+        log.warning(
+            `Scrape failed for ${described} (HTTP ${statusCode ?? 'no response'}) after ${secs(t.totalMs)}: ${message}`,
+        );
         sendFailed(res, 502, { url, error: message, statusCode, timing: t });
     } finally {
         dropJob(job.id);
@@ -585,6 +592,7 @@ server.listen(PORT, () => {
         JOB_TIMEOUT_SECS: JOB_TIMEOUT_MS / 1000,
         PARALLEL_SELLER,
         DEBUG_PAGE_ERRORS,
+        CRASH_GUARD,
         APIFY_PROXY: describeProxy(proxyChoice),
         APIFY_PROXY_PASSWORD: process.env.APIFY_PROXY_PASSWORD ? 'set' : 'not set',
         API_KEY: 'set',
