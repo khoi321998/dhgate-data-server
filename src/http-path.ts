@@ -10,8 +10,11 @@ import { emptyResponse, emptySeller, errorResponse } from './utils/defaults.js';
 import { createHttpClient, localeCookieHeader } from './utils/http.js';
 import { extractDhgateShipCountry, normalizeDhgateHost } from './utils/parse.js';
 
-/** The row, or why the HTTP path gave up — then the request goes to the browser, as before. */
-export type HttpPathOutcome = { row: ProductSellerResponse } | { fallback: string };
+/**
+ * The row, or why the HTTP path gave up — then the request goes to the browser, as before. `blocked`:
+ * the session was refused or dropped (see `BlockedError`), so the caller may try again on a new one.
+ */
+export type HttpPathOutcome = { row: ProductSellerResponse } | { fallback: string; blocked: boolean };
 
 /**
  * Scrape a request without a browser: the product page and the store pages over HTTP, through the
@@ -37,7 +40,9 @@ export async function scrapeOverHttp(
 
     if (mode === 'seller_only') {
         const store = await scrapeStoreOverHttp(url, client, log);
-        return store.kind === 'seller' ? { row: sellerRow(inputUrl, mode, store.seller) } : { fallback: `store: ${store.reason}` };
+        return store.kind === 'seller'
+            ? { row: sellerRow(inputUrl, mode, store.seller) }
+            : { fallback: `store: ${store.reason}`, blocked: store.blocked };
     }
 
     // product_and_seller: the store is scraped alongside, from the moment the product page gives its link.
@@ -50,7 +55,7 @@ export async function scrapeOverHttp(
         log.warning(`[product] item not found — ${product.reason}`, { url });
         return { row: errorResponse(inputUrl, mode, 'ITEM_NOT_FOUND', product.reason) };
     }
-    if (product.kind === 'failed') return { fallback: `product: ${product.reason}` };
+    if (product.kind === 'failed') return { fallback: `product: ${product.reason}`, blocked: product.blocked };
 
     const response: ProductSellerResponse = { ...emptyResponse(inputUrl, mode), product: product.product };
     if (mode !== 'product_and_seller') return { row: response };
@@ -73,6 +78,6 @@ export async function scrapeOverHttp(
         return { row: response };
     }
     const store = await pending.store;
-    if (store.kind === 'failed') return { fallback: `store: ${store.reason}` };
+    if (store.kind === 'failed') return { fallback: `store: ${store.reason}`, blocked: store.blocked };
     return { row: mergeSellerPart(response, sellerRow(inputUrl, mode, store.seller)) };
 }

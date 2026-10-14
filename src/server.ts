@@ -27,7 +27,7 @@ import { chooseChrome } from './utils/browser.js';
 import { passCloudflare } from './utils/cloudflare.js';
 import { DEBUG_PAGE_ERRORS, recordPageErrors } from './utils/debug.js';
 import { emptyResponse } from './utils/defaults.js';
-import { describeHttpError, setHttpRateLimit } from './utils/http.js';
+import { BlockedError, describeHttpError, setHttpRateLimit } from './utils/http.js';
 import { DEFAULT_SHIP_COUNTRY, extractDhgateShipCountry, normalizeDhgateHost } from './utils/parse.js';
 import { startQueuedNow } from './utils/pool.js';
 import { describeProxy, proxyChoiceFromEnv } from './utils/proxy.js';
@@ -95,6 +95,11 @@ if (proxyConfiguration) {
 const HTTP_MAX_RPS = intEnv('HTTP_MAX_RPS', proxyChoice.kind === 'RESIDENTIAL' ? 0 : 5, 0);
 setHttpRateLimit(HTTP_MAX_RPS);
 
+// New proxy sessions (new IPs) the HTTP path tries when its session is refused — a 403 / 429, Akamai's
+// "Access Denied", a Cloudflare challenge, a dropped connection — before it sends the job to the browser.
+// A page it cannot read is not retried: a new IP serves the same page. Without a proxy there is no IP to change.
+const HTTP_SESSION_RETRIES = intEnv('HTTP_SESSION_RETRIES', 3, 0);
+
 // Which browser binary we drive is the biggest single factor in how often Cloudflare challenges us,
 // so it is resolved and logged up front rather than buried in the launch options. See utils/browser.ts.
 const chrome = chooseChrome();
@@ -116,7 +121,7 @@ const localeCookies = (shipCountry: string) => [
 // already unhappy with us; a short pause makes failures easier to observe while testing.
 const RETRY_DELAY_MILLIS = 5_000;
 
-/** Run `fn` with the job's url + transactionId on every log line, when the request belongs to a job. */
+/** Run `fn` with the job's transactionId (or url, without one) on every log line, when the request belongs to a job. */
 async function withJobLog<T>(request: Request, fn: () => Promise<T>): Promise<T> {
     const job = jobOf(request);
     return job ? runWithJobPrefix(describeJob(job), fn) : fn();
@@ -451,31 +456,67 @@ async function waitForRow(job: Job): Promise<ProductSellerResponse> {
 
 /**
  * The job scraped without a browser (see `scrapeOverHttp`), or `null` when the HTTP path gave up and the
- * job should go to the browser, as before.
+ * job should go to the browser, as before. A refused session is retried on a new one (a new proxy IP)
+ * up to `HTTP_SESSION_RETRIES` times; anything else gives up at once. Every attempt is logged.
  */
 async function scrapeJobOverHttp(job: Job): Promise<ProductSellerResponse | null> {
     const startedAt = Date.now();
-    // A proxy session of its own, as the browser path's: one IP for every request of the job.
-    const proxyUrl = await proxyConfiguration?.newUrl(`http_${job.id.replace(/-/g, '')}`);
-    const outcome = await scrapeOverHttp(job.url, job.mode, proxyUrl, log).catch((error: unknown) => ({
-        fallback: describeHttpError(error),
-    }));
-    if ('fallback' in outcome) {
-        log.warning(`HTTP path gave up after ${secs(Date.now() - startedAt)} — scraping in a browser: ${outcome.fallback}`);
-        return null;
-    }
-    auditRow(outcome.row, log);
-    // Only a field no live page lacks (id, title, price, seller id / name) sends the job to the browser:
-    // without it the page was not read. A missing `warning` field (specifications, delivery, …) can be
-    // genuinely absent from the listing, and the browser would find it empty too — so it stays as is.
-    if (outcome.row.extraction.status === 'broken') {
-        log.warning(
-            `HTTP path gave up after ${secs(Date.now() - startedAt)} — scraping in a browser: missing ${outcome.row.extraction.missingFields.join(', ')}`,
+    const attempts = 1 + (proxyConfiguration ? HTTP_SESSION_RETRIES : 0);
+    const history: string[] = [];
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        const attemptStartedAt = Date.now();
+        // A proxy session of its own, as the browser path's: one IP for every request of the attempt.
+        const session = `http_${job.id.replace(/-/g, '')}_${attempt}`;
+        const proxyUrl = await proxyConfiguration?.newUrl(session);
+        const where = proxyUrl ? `session ${session}` : 'no proxy';
+        log.info(`HTTP attempt ${attempt}/${attempts} (${where})`);
+        const outcome = await scrapeOverHttp(job.url, job.mode, proxyUrl, log).catch((error: unknown) => ({
+            fallback: describeHttpError(error),
+            blocked: error instanceof BlockedError,
+        }));
+        const took = secs(Date.now() - attemptStartedAt);
+
+        if ('fallback' in outcome) {
+            history.push(`#${attempt} ${outcome.blocked ? 'blocked' : 'failed'} in ${took}: ${outcome.fallback}`);
+            if (outcome.blocked && attempt < attempts) {
+                log.warning(
+                    `HTTP attempt ${attempt}/${attempts} blocked after ${took} (${where}): ${outcome.fallback} — retrying on a new session`,
+                );
+                continue;
+            }
+            let why = 'not a block, a new session would not help';
+            if (outcome.blocked)
+                why = proxyConfiguration
+                    ? `still blocked after ${attempts} sessions`
+                    : 'blocked, and no proxy to change the IP';
+            log.warning(
+                `HTTP attempt ${attempt}/${attempts} ${outcome.blocked ? 'blocked' : 'failed'} after ${took} (${where}): ${outcome.fallback}`,
+            );
+            log.warning(
+                `HTTP path gave up after ${secs(Date.now() - startedAt)} (${why}) — scraping in a browser. Attempts: ${history.join(' | ')}`,
+            );
+            return null;
+        }
+
+        auditRow(outcome.row, log);
+        // Only a field no live page lacks (id, title, price, seller id / name) sends the job to the browser:
+        // without it the page was not read. A missing `warning` field (specifications, delivery, …) can be
+        // genuinely absent from the listing, and the browser would find it empty too — so it stays as is.
+        // Not retried: the page was served, so a new IP would get the same one.
+        if (outcome.row.extraction.status === 'broken') {
+            history.push(`#${attempt} failed in ${took}: missing ${outcome.row.extraction.missingFields.join(', ')}`);
+            log.warning(
+                `HTTP path gave up after ${secs(Date.now() - startedAt)} (not a block, a new session would not help) — scraping in a browser. Attempts: ${history.join(' | ')}`,
+            );
+            return null;
+        }
+        const earlier = history.length > 0 ? `, after ${history.length} blocked: ${history.join(' | ')}` : '';
+        log.info(
+            `Scraped over HTTP in ${secs(Date.now() - startedAt)} (attempt ${attempt}/${attempts}, ${where}${earlier})`,
         );
-        return null;
+        return outcome.row;
     }
-    log.info(`Scraped over HTTP in ${secs(Date.now() - startedAt)}`);
-    return outcome.row;
+    return null;
 }
 
 /** Drop the job's finished queue entries — they hold the scraped row — once the crawler is done with them. */
@@ -533,7 +574,7 @@ async function handleScrape(req: IncomingMessage, res: ServerResponse) {
     inProgress++;
     const job = createJob({ id: randomUUID(), url, transactionId, mode });
     try {
-        log.info(`Received ${described} (mode: ${mode}, ${describeLoad()})`);
+        log.info(`Received ${described}${transactionId ? ` ${url}` : ''} (mode: ${mode}, ${describeLoad()})`);
         // The HTTP path counts as the job's processing time, not its queue time.
         if (PRODUCT_OVER_HTTP) job.startedAt = Date.now();
         let row = PRODUCT_OVER_HTTP ? await runWithJobPrefix(described, async () => scrapeJobOverHttp(job)) : null;
@@ -634,6 +675,7 @@ server.listen(PORT, () => {
         PARALLEL_SELLER,
         PRODUCT_OVER_HTTP,
         HTTP_MAX_RPS,
+        HTTP_SESSION_RETRIES,
         DEBUG_PAGE_ERRORS,
         CRASH_GUARD,
         APIFY_PROXY: describeProxy(proxyChoice),

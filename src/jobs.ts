@@ -36,9 +36,12 @@ export interface JobUserData {
 const jobs = new Map<string, Job>();
 const resolvers = new Map<string, (row: ProductSellerResponse) => void>();
 
-/** "url" or "url [transactionId: x]" - every log line of a job starts with this. */
+/**
+ * "[transactionId: x]", or the url when the caller sent no transactionId - every log line of a job
+ * starts with this. The url itself is logged once, on the job's `Received` line.
+ */
 export function describeJob(job: Pick<Job, 'url' | 'transactionId'>): string {
-    return job.transactionId ? `${job.url} [transactionId: ${job.transactionId}]` : job.url;
+    return job.transactionId ? `[transactionId: ${job.transactionId}]` : job.url;
 }
 
 export function createJob(fields: Pick<Job, 'id' | 'url' | 'transactionId' | 'mode'>): Job {

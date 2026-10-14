@@ -11,7 +11,7 @@ import type {
 } from '../../dto/index.js';
 import { emptySeller } from '../../utils/defaults.js';
 import type { HttpClient } from '../../utils/http.js';
-import { describeHttpError } from '../../utils/http.js';
+import { BlockedError, describeHttpError, isBlockedStatus, isRefusalOrChallenge } from '../../utils/http.js';
 import {
     extractSellerId,
     normalizeImageUrl,
@@ -26,7 +26,10 @@ import type { RawPreviewCard } from './products.js';
 import { previewsFromCards } from './products.js';
 
 /** The seller, or why the HTTP path gave up — then the caller loads the store page in a tab instead. */
-export type StoreHttpResult = { kind: 'seller'; seller: Seller } | { kind: 'failed'; reason: string };
+export type StoreHttpResult =
+    | { kind: 'seller'; seller: Seller }
+    /** `blocked`: the session was refused or dropped (see `BlockedError`) — a new one may get through. */
+    | { kind: 'failed'; reason: string; blocked: boolean };
 
 /**
  * Scrape the store over plain HTTP — top-selling page, About Us, and the Review page with its three
@@ -49,7 +52,7 @@ export async function scrapeStoreOverHttp(storeUrl: string, client: HttpClient, 
         // The same test as `detectNotFound` for a seller: no store header, no store. The tab path
         // reports that properly (SELLER_NOT_FOUND), so it gets the call.
         if ($('.store-head-warp, .storeinfo, .storelogo').length === 0) {
-            return { kind: 'failed', reason: 'no store header in the HTML' };
+            return { kind: 'failed', reason: 'no store header in the HTML', blocked: false };
         }
 
         const previews = previewsFromCards(readPreviewCards($));
@@ -58,7 +61,7 @@ export async function scrapeStoreOverHttp(storeUrl: string, client: HttpClient, 
         const aboutHref = $('a[spm-c="oncabout"]').first().attr('href');
         const reviewUrl = reviewHref ? stripUrlParams(new URL(reviewHref, store.url).href) : null;
         const aboutUrl = aboutHref ? stripUrlParams(new URL(aboutHref, store.url).href) : null;
-        if (!reviewUrl) return { kind: 'failed', reason: 'no Review link on the store page' };
+        if (!reviewUrl) return { kind: 'failed', reason: 'no Review link on the store page', blocked: false };
 
         // About Us and the Review page do not depend on each other; the review filters need the Review page's form.
         const [about, review] = await Promise.all([
@@ -70,7 +73,7 @@ export async function scrapeStoreOverHttp(storeUrl: string, client: HttpClient, 
         const reviewScore = readReviewScore($review);
         const serviceScore = readServiceScore($review);
         const buckets = await readReviewBuckets(client, $review, review.url);
-        if (typeof buckets === 'string') return { kind: 'failed', reason: buckets };
+        if (typeof buckets === 'string') return { kind: 'failed', reason: buckets, blocked: false };
 
         const seller = emptySeller();
         seller.url = store.url;
@@ -99,19 +102,20 @@ export async function scrapeStoreOverHttp(storeUrl: string, client: HttpClient, 
         });
         return { kind: 'seller', seller };
     } catch (error) {
-        return { kind: 'failed', reason: describeHttpError(error) };
+        return { kind: 'failed', reason: describeHttpError(error), blocked: error instanceof BlockedError };
     }
 }
 
-/** GET a page; throws on a refusal or a challenge, so the caller falls back to the browser. */
+/** GET a page; throws on an HTTP error, and a `BlockedError` on a refusal or a challenge. */
 async function getPage(client: HttpClient, url: string): Promise<{ url: string; html: string }> {
     // A request the proxy drops is already sent once more by the client (see `createHttpClient`).
     const response = await client.fetch(url);
     const html = await response.text();
-    if (response.status >= 400) throw new Error(`HTTP ${response.status} for ${url}`);
-    if (/<title>[^<]*(access denied|just a moment|attention required)/i.test(html) || html.includes('_cf_chl_opt')) {
-        throw new Error(`refused or challenged at ${url}`);
+    if (response.status >= 400) {
+        const message = `HTTP ${response.status} for ${url}`;
+        throw isBlockedStatus(response.status) ? new BlockedError(message) : new Error(message);
     }
+    if (isRefusalOrChallenge(html)) throw new BlockedError(`refused or challenged at ${url}`);
     return { url: response.url || url, html };
 }
 

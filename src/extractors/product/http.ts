@@ -5,7 +5,7 @@ import { load } from 'cheerio';
 import type { Description, Media, Pricing, Product, Specification } from '../../dto/index.js';
 import { emptyProduct } from '../../utils/defaults.js';
 import type { HttpClient } from '../../utils/http.js';
-import { describeHttpError } from '../../utils/http.js';
+import { BlockedError, describeHttpError, isBlockedStatus, isRefusalOrChallenge } from '../../utils/http.js';
 import {
     extractProductId,
     extractSellerId,
@@ -28,7 +28,8 @@ const REVIEWS_PER_STAR = 5;
 export type ProductHttpResult =
     | { kind: 'product'; product: Product; sellerInline: SellerInline | null; storeUrl: string | null }
     | { kind: 'notFound'; reason: string }
-    | { kind: 'failed'; reason: string };
+    /** `blocked`: the session was refused or dropped (see `BlockedError`) — a new one may get through. */
+    | { kind: 'failed'; reason: string; blocked: boolean };
 
 /**
  * Scrape the product page without a browser: its HTML, plus the JSON APIs the page itself calls once
@@ -72,8 +73,10 @@ export async function scrapeProductOverHttp(
         if (response.status === 404 || response.status === 410) {
             return { kind: 'notFound', reason: `DHGate answered HTTP ${response.status} for this product URL` };
         }
-        if (response.status >= 400) return { kind: 'failed', reason: `HTTP ${response.status}` };
-        if (isRefusalOrChallenge(html)) return { kind: 'failed', reason: 'refused or challenged' };
+        if (response.status >= 400) {
+            return { kind: 'failed', reason: `HTTP ${response.status}`, blocked: isBlockedStatus(response.status) };
+        }
+        if (isRefusalOrChallenge(html)) return { kind: 'failed', reason: 'refused or challenged', blocked: true };
         if (!/\/product\/.*\/\d+\.html/.test(loadedUrl)) {
             return { kind: 'notFound', reason: `not a DHGate product page: ${loadedUrl}` };
         }
@@ -87,9 +90,11 @@ export async function scrapeProductOverHttp(
         const $ = load(html);
         const rsc = readFlightData(html);
         const title = readTitle($);
-        if (!title) return { kind: 'failed', reason: 'no title in the HTML' };
+        if (!title) return { kind: 'failed', reason: 'no title in the HTML', blocked: false };
         const pricing = pricingFromFlightData(rsc);
-        if (!pricing) return { kind: 'failed', reason: 'the price is shown in a way not checked against the browser' };
+        if (!pricing) {
+            return { kind: 'failed', reason: 'the price is shown in a way not checked against the browser', blocked: false };
+        }
         const storeUrl = readStoreUrl($, loadedUrl);
         if (storeUrl) onStoreUrl?.(storeUrl);
         const itemCode = extractProductId(loadedUrl) ?? '';
@@ -153,18 +158,17 @@ export async function scrapeProductOverHttp(
         });
         return { kind: 'product', product, sellerInline: readSellerInline($, rsc, loadedUrl), storeUrl };
     } catch (error) {
-        return { kind: 'failed', reason: describeHttpError(error) };
+        return { kind: 'failed', reason: describeHttpError(error), blocked: error instanceof BlockedError };
     }
-}
-
-function isRefusalOrChallenge(html: string): boolean {
-    return /<title>[^<]*(access denied|just a moment|attention required)/i.test(html) || html.includes('_cf_chl_opt');
 }
 
 /** GET one of the page's JSON APIs; throws unless it answered `state: 0x0000`. */
 async function getJson(client: HttpClient, url: string): Promise<{ data: unknown }> {
     const response = await client.fetch(url, { headers: { accept: 'application/json, text/plain, */*' } });
-    if (response.status !== 200) throw new Error(`HTTP ${response.status} from ${url.split('?')[0]}`);
+    if (response.status !== 200) {
+        const message = `HTTP ${response.status} from ${url.split('?')[0]}`;
+        throw isBlockedStatus(response.status) ? new BlockedError(message) : new Error(message);
+    }
     const json = (await response.json()) as { state?: string; data?: unknown };
     if (json.state !== '0x0000') throw new Error(`state ${json.state ?? '?'} from ${url.split('?')[0]}`);
     return { data: json.data };
@@ -191,7 +195,9 @@ function firstString(rsc: string, key: string): string | null {
 /**
  * What the buy box shows as the price — it is client-rendered, so it is rebuilt from its data:
  * - a new-buyer price (`showNewBuyerPrice`): that one price, `dealMaxMinBuyerPrice`;
- * - a promotion: `dealMinBuyerPrice` – `dealMaxBuyerPrice`.
+ * - a promotion: `dealMinBuyerPrice` – `dealMaxBuyerPrice`;
+ * - no promotion (no `deal…` price in `maxAndMinPriceVo`): `minBuyerPrice` – `maxBuyerPrice`, e.g.
+ *   0.72 – 1.25 on 828831238, as the browser read it.
  * Anything else has not been seen next to the browser's reading, so it gives `null` (the caller then
  * leaves the product to the browser).
  */
@@ -200,8 +206,16 @@ export function pricingFromFlightData(rsc: string): Pricing | null {
         const price = firstNumber(rsc, 'dealMaxMinBuyerPrice');
         return price == null ? null : { currency: 'USD', priceMin: price, priceMax: price };
     }
-    const min = firstNumber(rsc, 'dealMinBuyerPrice');
-    const max = firstNumber(rsc, 'dealMaxBuyerPrice');
+    let min = firstNumber(rsc, 'dealMinBuyerPrice');
+    let max = firstNumber(rsc, 'dealMaxBuyerPrice');
+    if (min == null && max == null) {
+        // Read inside `maxAndMinPriceVo`: `minBuyerPrice` alone is a common enough name to turn up elsewhere.
+        const vo = /"maxAndMinPriceVo":\{[^{}]*\}/.exec(rsc)?.[0] ?? '';
+        if (!vo.includes('Deal')) {
+            min = firstNumber(vo, 'minBuyerPrice');
+            max = firstNumber(vo, 'maxBuyerPrice');
+        }
+    }
     if (min == null || max == null || min > max) return null;
     return { currency: 'USD', priceMin: min, priceMax: max };
 }

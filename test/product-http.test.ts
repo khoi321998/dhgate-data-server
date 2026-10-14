@@ -35,10 +35,18 @@ describe('pricingFromFlightData', () => {
         expect(pricingFromFlightData(rsc)).toEqual({ currency: 'USD', priceMin: 3.1, priceMax: 5 });
     });
 
+    it('takes the regular range without a promotion', () => {
+        const rsc =
+            '"prodPrice":{"maxAndMinPriceVo":{"maxBuyerPrice":1.25,"minBuyerPrice":0.72,"minBuyerPriceUSD":0.72,"showNewBuyerPrice":false,"maxBuyerPriceMin":1.25}}';
+        expect(pricingFromFlightData(rsc)).toEqual({ currency: 'USD', priceMin: 0.72, priceMax: 1.25 });
+    });
+
     it('gives up on a missing or inverted range', () => {
         expect(pricingFromFlightData('"dealMinBuyerPrice":3')).toBeNull();
         expect(pricingFromFlightData('"dealMinBuyerPrice":6,"dealMaxBuyerPrice":5')).toBeNull();
         expect(pricingFromFlightData('"showNewBuyerPrice":true')).toBeNull();
+        expect(pricingFromFlightData('"minBuyerPrice":0.72,"maxBuyerPrice":1.25')).toBeNull();
+        expect(pricingFromFlightData('"maxAndMinPriceVo":{"maxBuyerPrice":1,"minBuyerPrice":2}')).toBeNull();
     });
 });
 

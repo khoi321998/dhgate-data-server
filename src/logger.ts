@@ -4,7 +4,7 @@ import { log } from 'apify';
 
 export { log };
 
-/** Prefix of the job running in the current async context: "url" or "url [transactionId: x]". */
+/** Prefix of the job running in the current async context: "[transactionId: x]", or "url" without one. */
 const jobPrefix = new AsyncLocalStorage<string>();
 
 /** The prefix of the job running here, to hand to callbacks that run outside this async context. */
@@ -17,8 +17,8 @@ export async function runWithJobPrefix<T>(prefix: string, fn: () => Promise<T>):
 }
 
 /**
- * Concurrent jobs interleave in the logs, so every line logged while a job runs carries the url +
- * transactionId of that job (grep-able by transactionId).
+ * Concurrent jobs interleave in the logs, so every line logged while a job runs carries the
+ * transactionId of that job (its url, without one), so a job can be grepped by transactionId.
  *
  * Every `log.child()` — Crawlee's crawler log, `ctx.log` in the handlers, the module-level `log` in
  * utils — shares the one logger instance it was created from, and most of them are created at import

@@ -39,6 +39,23 @@ export interface HttpIdentity {
 
 export type HttpResponse = Awaited<ReturnType<Impit['fetch']>>;
 
+/**
+ * The session was refused — HTTP 403 / 429, Akamai's "Access Denied", a Cloudflare challenge — or its
+ * proxy dropped the request twice. Unlike a page that cannot be read, a new session (a new proxy IP)
+ * may get through, so the HTTP path retries these on one before it goes to the browser.
+ */
+export class BlockedError extends Error {}
+
+/** A status the session itself earned: Akamai refuses a flagged IP with 403, a fast one with 429. */
+export function isBlockedStatus(status: number): boolean {
+    return status === 403 || status === 429;
+}
+
+/** Akamai's "Access Denied" page, or a Cloudflare challenge in place of the page. */
+export function isRefusalOrChallenge(html: string): boolean {
+    return /<title>[^<]*(access denied|just a moment|attention required)/i.test(html) || html.includes('_cf_chl_opt');
+}
+
 export interface HttpClient {
     fetch: (url: string, init?: { headers?: Record<string, string> }) => Promise<HttpResponse>;
 }
@@ -47,8 +64,9 @@ export interface HttpClient {
  * An HTTP client that looks like Chrome to DHGate: impit presents Chrome's TLS / HTTP2 fingerprint,
  * which Akamai checks — it answers Node's own `fetch` with 403 "Access Denied" on every page.
  *
- * A request the proxy drops (impit throws: connect, tunnel or read errors) is sent once more. A
- * refusal or a challenge is an answer, not a dropped request; callers judge those.
+ * A request the proxy drops (impit throws: connect, tunnel or read errors) is sent once more; dropped
+ * again, it throws a {@link BlockedError}. A refusal or a challenge is an answer, not a dropped
+ * request; callers judge those.
  */
 export function createHttpClient(identity: HttpIdentity): HttpClient {
     const client = new Impit({
@@ -68,7 +86,11 @@ export function createHttpClient(identity: HttpIdentity): HttpClient {
                 return await client.fetch(url, init);
             } catch {
                 await takeSlot();
-                return client.fetch(url, init);
+                try {
+                    return await client.fetch(url, init);
+                } catch (error) {
+                    throw new BlockedError(`connection dropped twice: ${describeHttpError(error)}`);
+                }
             }
         },
     };
